@@ -1,0 +1,75 @@
+name: Build PlantUML WebView2 Lister
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MSVC Dev Cmd
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install tools
+        shell: pwsh
+        run: |
+          choco install ninja zip -y
+
+      - name: Fetch NuGet + WebView2 SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path tools -Force | Out-Null
+          Invoke-WebRequest -Uri "https://dist.nuget.org/win-x86-commandline/latest/nuget.exe" -OutFile "tools\nuget.exe"
+          & tools\nuget.exe install Microsoft.Web.WebView2 -OutputDirectory "$env:RUNNER_TEMP\wv2" | Out-String
+          $pkg = Get-ChildItem "$env:RUNNER_TEMP\wv2" -Directory | Where-Object { $_.Name -like "Microsoft.Web.WebView2.*" } | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $pkg) { throw "WebView2 NuGet package not found" }
+
+          $inc = Join-Path $pkg.FullName "build\native\include"
+          $x64 = Join-Path $pkg.FullName "build\native\x64"
+
+          New-Item -ItemType Directory -Path "third_party\WebView2\build\native\include" -Force | Out-Null
+          New-Item -ItemType Directory -Path "third_party\WebView2\build\native\x64" -Force | Out-Null
+          Copy-Item "$inc\*.h" "third_party\WebView2\build\native\include\" -Force
+          Copy-Item "$x64\WebView2Loader.dll" "third_party\WebView2\build\native\x64\" -Force
+          Copy-Item "$x64\WebView2Loader.dll.lib" "third_party\WebView2\build\native\x64\" -Force
+
+      - name: Configure (CMake, Release)
+        shell: pwsh
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release -v
+
+      - name: Package (single ZIP, minimal)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path package\PlantUmlWebView -Force | Out-Null
+
+          # pick up the plugin (built as .wlx64 into dist/ per CMake)
+          $dll = Get-ChildItem -Path dist -Filter "PlantUmlWebView*.wlx64" -File -ErrorAction SilentlyContinue
+          if (-not $dll) { $dll = Get-ChildItem -Recurse -Filter "PlantUmlWebView*.wlx64" -File | Select-Object -First 1 }
+          if (-not $dll) { throw "Plugin WLX64 not found (build may have failed)" }
+
+          Copy-Item $dll.FullName package\PlantUmlWebView\
+          Copy-Item plantumlwebview.ini package\PlantUmlWebView\
+          Copy-Item resources\pluginst.inf package\PlantUmlWebView\
+          if (Test-Path README.md) { Copy-Item README.md package\PlantUmlWebView\ }
+
+          # ship the loader so it works even if Evergreen runtime isn't present
+          Copy-Item "third_party\WebView2\build\native\x64\WebView2Loader.dll" package\PlantUmlWebView\
+
+          Compress-Archive -Path package\PlantUmlWebView\* -DestinationPath PlantUmlWebView.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlantUmlWebView
+          path: PlantUmlWebView.zip
