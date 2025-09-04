@@ -1,3 +1,4 @@
+// src/plantuml_wlx_ev2.cpp
 // PlantUML WebView Lister (Tiny, Server-POST, SVG-preferred)
 // Build: CMake (produces PlantUmlWebView.wlx64)
 
@@ -52,7 +53,6 @@ static std::wstring JsEscape(const std::wstring& s) {
             case L'\r': out += L"\\r";  break;
             case L'\t': out += L"\\t";  break;
             default:
-                // keep printable BMP as-is; escape other control chars
                 if (ch < 0x20) {
                     wchar_t buf[7];
                     swprintf(buf, 7, L"\\u%04X", (unsigned)ch);
@@ -123,21 +123,6 @@ static std::wstring ReadFileUtf16OrAnsi(const wchar_t* path) {
     return w;
 }
 
-static std::wstring EscapeForJson(const std::wstring& w) {
-    std::wstring out; out.reserve(w.size() + 64);
-    for (wchar_t c : w) {
-        switch (c) {
-        case L'\\': out += L"\\\\"; break;
-        case L'"':  out += L"\\\""; break;
-        case L'\r': break;
-        case L'\n': out += L"\\n"; break;
-        case L'\t': out += L"\\t"; break;
-        default: out += c; break;
-        }
-    }
-    return out;
-}
-
 // ---------------------- WebView host ----------------------
 static const wchar_t* kWndClass = L"PumlWebViewHost";
 
@@ -146,20 +131,93 @@ struct Host {
     HINSTANCE hInst = nullptr;
     HMODULE   hWvLoader = nullptr;
 
-    Microsoft::WRL::ComPtr<ICoreWebView2Environment> env;
-    Microsoft::WRL::ComPtr<ICoreWebView2Controller>  ctrl;
-    Microsoft::WRL::ComPtr<ICoreWebView2>            web;
+    ComPtr<ICoreWebView2Environment> env;
+    ComPtr<ICoreWebView2Controller>  ctrl;
+    ComPtr<ICoreWebView2>            web;
 
-    std::wstring payloadJson;
+    std::wstring initialHtml; // what we will NavigateToString()
 };
 
-// server URL and format come from your settings; adjust names if different
-const std::string serverUtf8 = state.serverUrl;           // e.g. "https://www.plantuml.com/plantuml"
-const bool preferSvg = state.preferSvg;                   // true -> svg, false -> png
-const std::string umlUtf8 = umlText;                      // your PlantUML source text (UTF-8)
+// Function pointer type for dynamic loading of WebView2 loader
+typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
+    PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions*,
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
 
-// Create a single wide raw-string HTML document with placeholders.
-std::wstring html = LR"PUMLHTML(<!doctype html>
+// Window proc
+static LRESULT CALLBACK HostWndProc(HWND h, UINT m, WPARAM w, LPARAM l){
+    if(m==WM_SIZE){
+        auto* host = reinterpret_cast<Host*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+        if(host && host->ctrl){
+            RECT rc; GetClientRect(h, &rc);
+            host->ctrl->put_Bounds(rc);
+        }
+    }
+    if(m==WM_NCDESTROY){
+        auto* host = reinterpret_cast<Host*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+        if(host){
+            if(host->ctrl) host->ctrl->Close();
+            if(host->hWvLoader) FreeLibrary(host->hWvLoader);
+            delete host;
+        }
+        SetWindowLongPtrW(h, GWLP_USERDATA, 0);
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void EnsureWndClass(){
+    static bool inited = false;
+    if(inited) return;
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = HostWndProc;
+    wc.hInstance   = GetModuleHandleW(nullptr);
+    wc.hCursor     = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = kWndClass;
+    RegisterClassW(&wc);
+    inited = true;
+}
+
+static void InitWebView(struct Host* host){
+    // Dynamically load WebView2Loader.dll to avoid import libs
+    host->hWvLoader = LoadLibraryW(L"WebView2Loader.dll");
+    if(!host->hWvLoader){
+        CreateWindowW(L"STATIC", L"WebView2 Runtime not found. Install Edge WebView2 Runtime.", WS_CHILD|WS_VISIBLE|SS_CENTER,
+                      0,0,0,0, host->hwnd, nullptr, host->hInst, nullptr);
+        return;
+    }
+    auto fn = reinterpret_cast<PFN_CreateCoreWebView2EnvironmentWithOptions>(
+        GetProcAddress(host->hWvLoader, "CreateCoreWebView2EnvironmentWithOptions"));
+    if(!fn){
+        CreateWindowW(L"STATIC", L"WebView2 loader entry not found.", WS_CHILD|WS_VISIBLE|SS_CENTER,
+                      0,0,0,0, host->hwnd, nullptr, host->hInst, nullptr);
+        return;
+    }
+
+    fn(nullptr, nullptr, nullptr,
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [host](HRESULT hr, ICoreWebView2Environment* env)->HRESULT{
+                if(FAILED(hr) || !env) return S_OK;
+                host->env = env;
+                env->CreateCoreWebView2Controller(host->hwnd,
+                    Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                        [host](HRESULT hr, ICoreWebView2Controller* ctrl)->HRESULT{
+                            if(FAILED(hr) || !ctrl) return S_OK;
+                            host->ctrl = ctrl;
+                            host->ctrl->get_CoreWebView2(&host->web);
+                            RECT rc; GetClientRect(host->hwnd, &rc);
+                            host->ctrl->put_Bounds(rc);
+
+                            // Navigate with UTF-16 as required by WebView2
+                            if (!host->initialHtml.empty())
+                                host->web->NavigateToString(host->initialHtml.c_str());
+                            return S_OK;
+                        }).Get());
+                return S_OK;
+            }).Get());
+}
+
+// Build the HTML page (one wide raw string) and fill placeholders
+static std::wstring MakeHtml(const std::wstring& serverUrl, const std::wstring& prefer, const std::wstring& umlText) {
+    std::wstring html = LR"PUMLHTML(<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -167,9 +225,7 @@ std::wstring html = LR"PUMLHTML(<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>PlantUML Viewer</title>
   <style>
-    :root {
-      color-scheme: light dark;
-    }
+    :root { color-scheme: light dark; }
     html, body { height: 100%; }
     body {
       margin: 0;
@@ -178,7 +234,6 @@ std::wstring html = LR"PUMLHTML(<!doctype html>
       font: 13px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       overflow: auto;
     }
-    /* SVG container theming + scroll */
     #root {
       display: flex;
       align-items: start;
@@ -189,7 +244,7 @@ std::wstring html = LR"PUMLHTML(<!doctype html>
     #hud {
       position: fixed;
       right: 8px; top: 8px;
-      background: color-mix(in oklab, Canvas 80%, CanvasText 20%);
+      background: rgba(127,127,127,.15);
       color: CanvasText;
       border-radius: 999px;
       padding: 4px 10px;
@@ -199,8 +254,7 @@ std::wstring html = LR"PUMLHTML(<!doctype html>
       -webkit-user-select: none;
       pointer-events: none;
     }
-    img { max-width: 100%; height: auto; }
-    svg { max-width: 100%; height: auto; }
+    img, svg { max-width: 100%; height: auto; }
   </style>
 </head>
 <body>
@@ -243,136 +297,42 @@ std::wstring html = LR"PUMLHTML(<!doctype html>
         setHUD('error');
       });
 
-      // Copy-to-clipboard: Ctrl+C exports SVG text or PNG bitmap
-      document.addEventListener('keydown', async (ev) => {
-        if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'c') {
-          ev.preventDefault();
-          try {
-            if (FORMAT === 'svg') {
-              const sel = root.querySelector('svg');
-              if (sel) {
-                const text = new XMLSerializer().serializeToString(sel);
-                await navigator.clipboard.writeText(text);
-                setHUD('copied SVG');
-              }
-            } else {
-              const img = root.querySelector('img');
-              if (img) {
-                const c = document.createElement('canvas');
-                c.width = img.naturalWidth; c.height = img.naturalHeight;
-                const g = c.getContext('2d');
-                g.drawImage(img, 0, 0);
-                const blob = await new Promise(r => c.toBlob(r, 'image/png'));
-                await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-                setHUD('copied PNG');
-              }
+      // Optional: expose a function for WLX copy command
+      window.copyCurrent = async function(){
+        try {
+          if (FORMAT === 'svg') {
+            const sel = root.querySelector('svg');
+            if (sel) {
+              const text = new XMLSerializer().serializeToString(sel);
+              await navigator.clipboard.writeText(text);
+              setHUD('copied SVG');
             }
-          } catch(e) { setHUD('copy failed'); }
-        }
-      });
+          } else {
+            const img = root.querySelector('img');
+            if (img) {
+              const c = document.createElement('canvas');
+              c.width = img.naturalWidth; c.height = img.naturalHeight;
+              const g = c.getContext('2d');
+              g.drawImage(img, 0, 0);
+              const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+              await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+              setHUD('copied PNG');
+            }
+          }
+        } catch(e) { setHUD('copy failed'); }
+      };
     })();
   </script>
 </body>
 </html>
 )PUMLHTML";
 
-// Fill placeholders.
-ReplaceAll(html, L"{{SERVER}}",  FromUtf8(serverUtf8));
-ReplaceAll(html, L"{{FORMAT}}",  preferSvg ? std::wstring(L"svg") : std::wstring(L"png"));
-ReplaceAll(html, L"{{DATA}}",    JsEscape(FromUtf8(umlUtf8)));
-
-// Navigate with UTF-16 as required by WebView2
-webview->NavigateToString(html.c_str());
-
-// Function pointer type for dynamic loading of WebView2 loader
-typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
-    PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions*,
-    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
-
-// Window proc
-static LRESULT CALLBACK HostWndProc(HWND h, UINT m, WPARAM w, LPARAM l){
-    if(m==WM_SIZE){
-        auto* host = reinterpret_cast<Host*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-        if(host && host->ctrl){
-            RECT rc; GetClientRect(h, &rc);
-            host->ctrl->put_Bounds(rc);
-        }
-    }
-    if(m==WM_NCDESTROY){
-        auto* host = reinterpret_cast<Host*>(GetWindowLongPtrW(h, GWLP_USERDATA));
-        if(host){
-            if(host->ctrl) host->ctrl->Close();
-            if(host->hWvLoader) FreeLibrary(host->hWvLoader);
-            delete host;
-        }
-        SetWindowLongPtrW(h, GWLP_USERDATA, 0);
-    }
-    return DefWindowProcW(h, m, w, l);
-}
-
-static void EnsureWndClass(){
-    static bool inited = false;
-    if(inited) return;
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = HostWndProc;
-    wc.hInstance   = GetModuleHandleW(nullptr);
-    wc.hCursor     = LoadCursor(nullptr, IDC_ARROW);
-    wc.lpszClassName = L"PumlWebViewHost";
-    RegisterClassW(&wc);
-    inited = true;
-}
-
-static void InitWebView(struct Host* host){
-    // Dynamically load WebView2Loader.dll to avoid import libs
-    host->hWvLoader = LoadLibraryW(L"WebView2Loader.dll");
-    if(!host->hWvLoader){
-        CreateWindowW(L"STATIC", L"WebView2 Runtime not found. Install Edge WebView2 Runtime.", WS_CHILD|WS_VISIBLE|SS_CENTER,
-                      0,0,0,0, host->hwnd, nullptr, host->hInst, nullptr);
-        return;
-    }
-    auto fn = reinterpret_cast<PFN_CreateCoreWebView2EnvironmentWithOptions>(
-        GetProcAddress(host->hWvLoader, "CreateCoreWebView2EnvironmentWithOptions"));
-    if(!fn){
-        CreateWindowW(L"STATIC", L"WebView2 loader entry not found.", WS_CHILD|WS_VISIBLE|SS_CENTER,
-                      0,0,0,0, host->hwnd, nullptr, host->hInst, nullptr);
-        return;
-    }
-
-    fn(nullptr, nullptr, nullptr,
-        Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [host](HRESULT hr, ICoreWebView2Environment* env)->HRESULT{
-                if(FAILED(hr) || !env) return S_OK;
-                host->env = env;
-                env->CreateCoreWebView2Controller(host->hwnd,
-                    Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [host](HRESULT hr, ICoreWebView2Controller* ctrl)->HRESULT{
-                            if(FAILED(hr) || !ctrl) return S_OK;
-                            host->ctrl = ctrl;
-                            host->ctrl->get_CoreWebView2(&host->web);
-                            RECT rc; GetClientRect(host->hwnd, &rc);
-                            host->ctrl->put_Bounds(rc);
-                            host->web->NavigateToString(kHtml);
-
-                            EventRegistrationToken token{};
-                            host->web->add_WebMessageReceived(
-                                Microsoft::WRL::Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                    [host](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* e)->HRESULT{
-                                        LPWSTR j = nullptr;
-                                        e->TryGetWebMessageAsString(&j);
-                                        if(j){
-                                            if(wcsstr(j, L"\"ready\":true")){
-                                                if(!host->payloadJson.empty())
-                                                    host->web->PostWebMessageAsJson(host->payloadJson.c_str());
-                                            }
-                                            CoTaskMemFree(j);
-                                        }
-                                        return S_OK;
-                                    }).Get(), &token);
-
-                            return S_OK;
-                        }).Get());
-                return S_OK;
-            }).Get());
+    std::wstring fmt = (prefer == L"png") ? L"png" : L"svg";
+    std::wstring data = JsEscape(umlText);
+    ReplaceAll(html, L"{{SERVER}}", serverUrl);
+    ReplaceAll(html, L"{{FORMAT}}", fmt);
+    ReplaceAll(html, L"{{DATA}}",   data);
+    return html;
 }
 
 // ---------------------- WLX exports ----------------------
@@ -390,19 +350,14 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
 
     auto* host = new Host();
     host->hInst = GetModuleHandleW(nullptr);
-    host->hwnd  = CreateWindowExW(0, L"PumlWebViewHost", L"",
+    host->hwnd  = CreateWindowExW(0, kWndClass, L"",
                                   WS_CHILD|WS_VISIBLE, 0,0,0,0,
                                   ParentWin, nullptr, host->hInst, nullptr);
     SetWindowLongPtrW(host->hwnd, GWLP_USERDATA, (LONG_PTR)host);
 
-    std::wstring text = ReadFileUtf16OrAnsi(FileToLoad);
-    std::wstring esc  = EscapeForJson(text);
-
-    std::wstringstream js;
-    js << L"{\\"type\\":\\"load\\",\\"server\\":\\"" << g_serverUrl
-       << L"\\",\\"prefer\\":\\"" << g_prefer
-       << L"\\",\\"index\\":0,\\"text\\":\\"" << esc << L"\\"}";
-    host->payloadJson = js.str();
+    // Read file and build HTML (single raw string with placeholders)
+    std::wstring uml = ReadFileUtf16OrAnsi(FileToLoad);
+    host->initialHtml = MakeHtml(g_serverUrl, g_prefer, uml);
 
     InitWebView(host);
     return host->hwnd;
@@ -425,4 +380,3 @@ __declspec(dllexport) void __stdcall ListCloseWindow(HWND ListWin) {
 }
 
 } // extern "C"
-
