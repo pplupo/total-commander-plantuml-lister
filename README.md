@@ -161,8 +161,3 @@ set_target_properties(PlantUmlWebView PROPERTIES OUTPUT_NAME "PlantUmlWebView" S
 * [PlantUML](https://plantuml.com/) – the rendering engine.
 * Microsoft **WebView2** – lightweight HTML rendering inside Lister.
 * **Total Commander** – for the flexible Lister plugin interface.
-
-```
-::contentReference[oaicite:0]{index=0}
-```
-
