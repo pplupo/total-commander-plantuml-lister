@@ -19,7 +19,7 @@ Powered by **WebView2** — no Qt or zlib required.
 
 * **Total Commander 64-bit** (Lister/WLX plugin support).
 * **Microsoft Edge WebView2 Runtime** (evergreen).  
-  👉 Download from Microsoft: <https://developer.microsoft.com/en-us/microsoft-edge/webview2/?form=MA13LH#download>
+  👉 Download from Microsoft: <https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download>
 * For **server rendering**: a reachable **PlantUML HTTP server** (defaults to the public service).
 * For **local rendering**: **Java** (`javaw.exe`/`java.exe`) and **`plantuml.jar`** (shipped with releases).
 
