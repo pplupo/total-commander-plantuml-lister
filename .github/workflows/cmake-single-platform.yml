@@ -1,4 +1,4 @@
-name: Build PlantUML WebView2 Lister
+name: Build TC PlantUML WebView Lister
 
 on:
   workflow_dispatch: {}
@@ -8,80 +8,92 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        shell: pwsh
+        run: |
+          choco install ninja 7zip -y
+
+      # Get latest WebView2 SDK (headers + loader)
+      - name: Fetch WebView2 SDK (NuGet latest)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pkg = "$env:RUNNER_TEMP\webview2.nupkg"
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2" -OutFile $pkg
+          & "C:\Program Files\7-Zip\7z.exe" x $pkg "-o$env:RUNNER_TEMP\webview2" -y | Out-Null
+
+          New-Item -ItemType Directory -Force -Path "third_party\WebView2\build\native\include" | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\webview2\build\native\include\*" "third_party\WebView2\build\native\include" -Recurse -Force
+
+          New-Item -ItemType Directory -Force -Path "third_party\WebView2\build\native\x64" | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\webview2\build\native\x64\WebView2Loader.dll" "third_party\WebView2\build\native\x64\WebView2Loader.dll" -Force
 
       - name: MSVC Dev Cmd
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Install tools
+      - name: Configure (CMake)
         shell: pwsh
         run: |
-          choco install ninja zip -y
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-      - name: Fetch NuGet + WebView2 SDK
+      - name: Build (CMake)
+        shell: pwsh
+        run: |
+          cmake --build build --config Release -v
+
+      - name: Verify built WLX at dist/
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Path tools -Force | Out-Null
-          Invoke-WebRequest -Uri "https://dist.nuget.org/win-x86-commandline/latest/nuget.exe" -OutFile "tools\nuget.exe"
-          & tools\nuget.exe install Microsoft.Web.WebView2 -OutputDirectory "$env:RUNNER_TEMP\wv2" | Out-String
-          $pkg = Get-ChildItem "$env:RUNNER_TEMP\wv2" -Directory | Where-Object { $_.Name -like "Microsoft.Web.WebView2.*" } | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $pkg) { throw "WebView2 NuGet package not found" }
+          if (!(Test-Path "dist\PlantUmlWebView.wlx64")) {
+            # Last-resort: if SUFFIX wasn't honored for any reason, try to find and rename.
+            $candidate = Get-ChildItem -Recurse -File -Filter "PlantUmlWebView*.dll" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($candidate) {
+              New-Item -ItemType Directory -Force -Path dist | Out-Null
+              Copy-Item $candidate.FullName "dist\PlantUmlWebView.wlx64" -Force
+            }
+          }
+          if (!(Test-Path "dist\PlantUmlWebView.wlx64")) {
+            Get-ChildItem -Recurse -File | Select-Object FullName,Length,LastWriteTime | Out-String -Width 2000 | Write-Host
+            throw "Build succeeded but dist\PlantUmlWebView.wlx64 not found."
+          }
 
-          $inc = Join-Path $pkg.FullName "build\native\include"
-          $x64 = Join-Path $pkg.FullName "build\native\x64"
-
-          New-Item -ItemType Directory -Path "third_party\WebView2\build\native\include" -Force | Out-Null
-          New-Item -ItemType Directory -Path "third_party\WebView2\build\native\x64" -Force | Out-Null
-          Copy-Item "$inc\*.h" "third_party\WebView2\build\native\include\" -Force
-          Copy-Item "$x64\WebView2Loader.dll" "third_party\WebView2\build\native\x64\" -Force
-          Copy-Item "$x64\WebView2Loader.dll.lib" "third_party\WebView2\build\native\x64\" -Force
-
-      - name: Configure (CMake, Release)
-        shell: pwsh
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        shell: pwsh
-        run: cmake --build build --config Release -v
-
-      # --- Stage files into a clean folder ---
       - name: Stage plugin files
         shell: pwsh
         run: |
-          $stage = "package/PlantUmlWebView"
+          $ErrorActionPreference = "Stop"
+          $stage = "package\PlantUmlWebView"
           Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-      
-          Copy-Item -Force dist\PlantUmlWebView.wlx64         $stage\
+
+          Copy-Item -Force dist\PlantUmlWebView.wlx64              $stage\
           Copy-Item -Force third_party\WebView2\build\native\x64\WebView2Loader.dll $stage\
-          Copy-Item -Force resources\pluginst.inf             $stage\
-          Copy-Item -Force src\plantumlwebview.ini            $stage\
-          if (Test-Path README.md) { Copy-Item -Force README.md $stage\ }
-      
-      # --- Package ONCE: files at the root of the zip ---
-      - name: Package (single zip with correct root)
+          Copy-Item -Force resources\pluginst.inf                   $stage\
+          Copy-Item -Force src\plantumlwebview.ini                  $stage\
+          if (Test-Path README.md) { Copy-Item -Force README.md     $stage\ }
+
+      - name: Package (single zip with root files)
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $out = "PlantUmlWebView.zip"
           Remove-Item -Force $out -ErrorAction SilentlyContinue
-          # make sure no old zips creep into the payload
-          Get-ChildItem package\PlantUmlWebView -Filter *.zip -File -Recurse | Remove-Item -Force
-      
           Compress-Archive -Path package\PlantUmlWebView\* -DestinationPath $out -Force
-      
-          # Sanity-check: pluginst.inf must be at zip root and no nested zips
+
+          # sanity: pluginst.inf at root; no nested zips
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [IO.Compression.ZipFile]::OpenRead($out)
-          $hasInfAtRoot = $zip.Entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | ForEach-Object { $true } | Select-Object -First 1
-          $nestedZips   = $zip.Entries | Where-Object { $_.FullName -match '\.zip$' }
+          $hasInf = $zip.Entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | Select-Object -First 1
+          $nested = $zip.Entries | Where-Object { $_.FullName -match '\.zip$' }
           $zip.Dispose()
-          if (-not $hasInfAtRoot) { throw "pluginst.inf is not at the root of $out" }
-          if ($nestedZips)       { throw "Nested zip(s) found in $out: $($nestedZips.FullName -join ', ')" }
-      
-      # --- Upload just the one zip we created ---
+          if (-not $hasInf) { throw "pluginst.inf is not at the root of $out" }
+          if ($nested)      { throw "Nested zip(s) found in $out: $($nested.FullName -join ', ')" }
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
