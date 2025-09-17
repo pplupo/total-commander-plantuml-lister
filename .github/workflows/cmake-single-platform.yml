@@ -77,18 +77,13 @@ jobs:
           Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force $stage | Out-Null
 
-          # Built DLL
-          if (!(Test-Path dist\PlantUmlWebView.wlx64)) {
-            throw "dist\PlantUmlWebView.wlx64 not found"
-          }
+          if (!(Test-Path dist\PlantUmlWebView.wlx64)) { throw "dist\PlantUmlWebView.wlx64 not found" }
           Copy-Item -Force dist\PlantUmlWebView.wlx64 $stage\
 
-          # pluginst.inf is fixed under /resources/
           $inf = "resources\pluginst.inf"
           if (!(Test-Path $inf)) { throw "$inf not found" }
           Copy-Item -Force $inf $stage\
 
-          # INI (prefer repo root; fallback to src/)
           if (Test-Path .\plantumlwebview.ini) {
             Copy-Item -Force .\plantumlwebview.ini $stage\
           } elseif (Test-Path .\src\plantumlwebview.ini) {
@@ -97,10 +92,8 @@ jobs:
             Write-Host "No plantumlwebview.ini found; skipping."
           }
 
-          # README (optional)
           if (Test-Path .\README.md) { Copy-Item -Force .\README.md $stage\ }
 
-          # WebView2 loader
           $wv2 = "third_party\WebView2\build\native\x64\WebView2Loader.dll"
           if (!(Test-Path $wv2)) { throw "WebView2Loader.dll not found at $wv2" }
           Copy-Item -Force $wv2 $stage\
@@ -112,17 +105,16 @@ jobs:
           Remove-Item -Force $out -ErrorAction SilentlyContinue
           Compress-Archive -Path package\PlantUmlWebView\* -DestinationPath $out -Force
 
-          # sanity: pluginst.inf at root; no nested zips
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [IO.Compression.ZipFile]::OpenRead($out)
           try {
             $entries = $zip.Entries
             $hasInf  = $entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | Select-Object -First 1
             $nested  = $entries | Where-Object { $_.FullName -match '\.zip$' } | ForEach-Object { $_.FullName }
-            if (-not $hasInf) { throw "pluginst.inf is not at the root of $out" }
+            if (-not $hasInf) { throw "pluginst.inf is not at the root of ${out}" }
             if ($nested.Count -gt 0) {
               $list = ($nested -join ', ')
-              throw "Nested zip(s) found in $out: $list"
+              throw "Nested zip(s) found in ${out}: $list"
             }
           } finally {
             $zip.Dispose()
