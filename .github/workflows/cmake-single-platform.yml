@@ -118,22 +118,36 @@ jobs:
           # Optional README
           if (Test-Path README.md) { Copy-Item -Force README.md $stage\ }
 
-      - name: Package (single zip with root files)
+      - name: Create plugin zip (flat root)
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          $out = "PlantUmlWebView.zip"
-          Remove-Item -Force $out -ErrorAction SilentlyContinue
-          Compress-Archive -Path package\PlantUmlWebView\* -DestinationPath $out -Force
-
-          # sanity: pluginst.inf at root; no nested zips
+          $ErrorActionPreference = 'Stop'
+      
+          $stage = 'package\PlantUmlWebView'
+          if (-not (Test-Path $stage)) { throw ("Staging folder not found: {0}" -f $stage) }
+      
+          $out = 'PlantUmlWebView.zip'
+          if (Test-Path $out) { Remove-Item -Force $out }
+      
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $out -Force
+      
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [IO.Compression.ZipFile]::OpenRead($out)
-          $hasInf = $zip.Entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | Select-Object -First 1
-          $nested = $zip.Entries | Where-Object { $_.FullName -match '\.zip$' }
-          $zip.Dispose()
-          if (-not $hasInf) { throw "pluginst.inf is not at the root of $out" }
-          if ($nested)      { throw "Nested zip(s) found in $out: $($nested.FullName -join ', ')" }
+          try {
+            $hasInf = $zip.Entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | Select-Object -First 1
+            if (-not $hasInf) {
+              throw ("pluginst.inf is not at the root of {0}" -f $out)
+            }
+      
+            $nested = $zip.Entries | Where-Object { $_.FullName -match '\.zip$' }
+            if ($nested.Count -gt 0) {
+              $names = ($nested | ForEach-Object { $_.FullName }) -join ', '
+              throw ("Nested zip(s) found in {0}: {1}" -f $out, $names)
+            }
+          } finally {
+            $zip.Dispose()
+          }
+
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
