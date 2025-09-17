@@ -47,27 +47,41 @@ jobs:
         shell: pwsh
         run: cmake --build build --config Release -v
 
-      - name: Package (single ZIP, minimal)
+      # --- Stage files into a clean folder ---
+      - name: Stage plugin files
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Path package\PlantUmlWebView -Force | Out-Null
-
-          # pick up the plugin (built as .wlx64 into dist/ per CMake)
-          $dll = Get-ChildItem -Path dist -Filter "PlantUmlWebView*.wlx64" -File -ErrorAction SilentlyContinue
-          if (-not $dll) { $dll = Get-ChildItem -Recurse -Filter "PlantUmlWebView*.wlx64" -File | Select-Object -First 1 }
-          if (-not $dll) { throw "Plugin WLX64 not found (build may have failed)" }
-
-          Copy-Item $dll.FullName package\PlantUmlWebView\
-          Copy-Item plantumlwebview.ini package\PlantUmlWebView\
-          Copy-Item resources\pluginst.inf package\PlantUmlWebView\
-          if (Test-Path README.md) { Copy-Item README.md package\PlantUmlWebView\ }
-
-          # ship the loader so it works even if Evergreen runtime isn't present
-          Copy-Item "third_party\WebView2\build\native\x64\WebView2Loader.dll" package\PlantUmlWebView\
-
-          Compress-Archive -Path package\PlantUmlWebView\* -DestinationPath PlantUmlWebView.zip -Force
-
+          $stage = "package/PlantUmlWebView"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+      
+          Copy-Item -Force dist\PlantUmlWebView.wlx64         $stage\
+          Copy-Item -Force third_party\WebView2\build\native\x64\WebView2Loader.dll $stage\
+          Copy-Item -Force resources\pluginst.inf             $stage\
+          Copy-Item -Force src\plantumlwebview.ini            $stage\
+          if (Test-Path README.md) { Copy-Item -Force README.md $stage\ }
+      
+      # --- Package ONCE: files at the root of the zip ---
+      - name: Package (single zip with correct root)
+        shell: pwsh
+        run: |
+          $out = "PlantUmlWebView.zip"
+          Remove-Item -Force $out -ErrorAction SilentlyContinue
+          # make sure no old zips creep into the payload
+          Get-ChildItem package\PlantUmlWebView -Filter *.zip -File -Recurse | Remove-Item -Force
+      
+          Compress-Archive -Path package\PlantUmlWebView\* -DestinationPath $out -Force
+      
+          # Sanity-check: pluginst.inf must be at zip root and no nested zips
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [IO.Compression.ZipFile]::OpenRead($out)
+          $hasInfAtRoot = $zip.Entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | ForEach-Object { $true } | Select-Object -First 1
+          $nestedZips   = $zip.Entries | Where-Object { $_.FullName -match '\.zip$' }
+          $zip.Dispose()
+          if (-not $hasInfAtRoot) { throw "pluginst.inf is not at the root of $out" }
+          if ($nestedZips)       { throw "Nested zip(s) found in $out: $($nestedZips.FullName -join ', ')" }
+      
+      # --- Upload just the one zip we created ---
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
