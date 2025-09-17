@@ -68,14 +68,49 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $stage = "package\PlantUmlWebView"
-          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          Copy-Item -Force dist\PlantUmlWebView.wlx64              $stage\
+          # Mandatory binaries
+          Copy-Item -Force dist\PlantUmlWebView.wlx64 $stage\
           Copy-Item -Force third_party\WebView2\build\native\x64\WebView2Loader.dll $stage\
-          Copy-Item -Force resources\pluginst.inf                   $stage\
-          Copy-Item -Force src\plantumlwebview.ini                  $stage\
-          if (Test-Path README.md) { Copy-Item -Force README.md     $stage\ }
+
+          # pluginst.inf (copy if present, else create a minimal one)
+          $pluginst = "resources\pluginst.inf"
+          if (Test-Path $pluginst) {
+            Copy-Item -Force $pluginst $stage\
+          } else {
+@"
+[plugininstall]
+defaultextension=puml plantuml uml wsd ws iuml
+"@ | Set-Content -Encoding ASCII (Join-Path $stage "pluginst.inf")
+          }
+
+          # plantumlwebview.ini: try several locations; if missing, write defaults
+          $iniCandidates = @(
+            "src\plantumlwebview.ini",
+            "plantumlwebview.ini",
+            "resources\plantumlwebview.ini",
+            ".\plantumlwebview.ini"
+          )
+          $iniSrc = $iniCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($iniSrc) {
+            Copy-Item -Force $iniSrc (Join-Path $stage "plantumlwebview.ini")
+          } else {
+@"
+[server]
+url=https://www.plantuml.com/plantuml
+
+[render]
+prefer=svg
+
+[detect]
+string=EXT=""PUML"" | EXT=""PLANTUML"" | EXT=""UML"" | EXT=""WSD"" | EXT=""WS"" | EXT=""IUML""
+"@ | Set-Content -Encoding UTF8 (Join-Path $stage "plantumlwebview.ini")
+          }
+
+          # Optional README if present
+          if (Test-Path README.md) { Copy-Item -Force README.md $stage\ }
 
       - name: Package (single zip with root files)
         shell: pwsh
