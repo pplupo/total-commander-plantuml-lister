@@ -1,35 +1,52 @@
-name: Build TC PlantUML WebView Lister
+name: Build + Release (PlantUmlWebView)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create/update release for (e.g. v0.3.0). If empty, uses manual-<sha>."
+        required: false
+      draft:
+        description: "Create release as draft?"
+        required: true
+        default: "true"
+  push:
+    tags:
+      - "v*"
+      - "V*"
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install tools
-        shell: pwsh
         run: |
-          choco install ninja 7zip -y
+          choco install ninja -y
+          choco install nuget.commandline -y
 
-      # Get latest WebView2 SDK (headers + loader)
-      - name: Fetch WebView2 SDK (NuGet latest)
-        shell: pwsh
+      - name: Fetch WebView2 SDK (headers + loader DLL)
         run: |
-          $ErrorActionPreference = "Stop"
-          $pkg = "$env:RUNNER_TEMP\webview2.nupkg"
-          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2" -OutFile $pkg
-          & "C:\Program Files\7-Zip\7z.exe" x $pkg "-o$env:RUNNER_TEMP\webview2" -y | Out-Null
+          # Get nuget package
+          nuget install Microsoft.Web.WebView2 -Version 1.0.2592.51 -OutputDirectory third_party -ExcludeVersion
 
-          New-Item -ItemType Directory -Force -Path "third_party\WebView2\build\native\include" | Out-Null
-          Copy-Item "$env:RUNNER_TEMP\webview2\build\native\include\*" "third_party\WebView2\build\native\include" -Recurse -Force
-
-          New-Item -ItemType Directory -Force -Path "third_party\WebView2\build\native\x64" | Out-Null
-          Copy-Item "$env:RUNNER_TEMP\webview2\build\native\x64\WebView2Loader.dll" "third_party\WebView2\build\native\x64\WebView2Loader.dll" -Force
+          # Flatten to the path CMake includes:
+          # third_party\WebView2\build\native\include  (+ x64\WebView2Loader.dll)
+          Remove-Item -ErrorAction SilentlyContinue -Recurse -Force third_party\WebView2
+          New-Item -ItemType Directory -Force third_party\WebView2\build\native | Out-Null
+          Copy-Item -Recurse third_party\Microsoft.Web.WebView2\build\native\include third_party\WebView2\build\native\
+          New-Item -ItemType Directory -Force third_party\WebView2\build\native\x64 | Out-Null
+          Copy-Item third_party\Microsoft.Web.WebView2\build\native\x64\WebView2Loader.dll third_party\WebView2\build\native\x64\
 
       - name: MSVC Dev Cmd
         uses: ilammy/msvc-dev-cmd@v1
@@ -37,120 +54,79 @@ jobs:
           arch: x64
 
       - name: Configure (CMake)
-        shell: pwsh
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_RUNTIME_OUTPUT_DIRECTORY="${{ github.workspace }}\dist" `
+            -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${{ github.workspace }}\dist"
 
-      - name: Build (CMake)
-        shell: pwsh
-        run: |
-          cmake --build build --config Release -v
+      - name: Build
+        run: cmake --build build --config Release -v
 
-      - name: Verify built WLX at dist/
-        shell: pwsh
+      - name: Verify build outputs
         run: |
-          $ErrorActionPreference = "Stop"
-          if (!(Test-Path "dist\PlantUmlWebView.wlx64")) {
-            # Last-resort: if SUFFIX wasn't honored for any reason, try to find and rename.
-            $candidate = Get-ChildItem -Recurse -File -Filter "PlantUmlWebView*.dll" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($candidate) {
-              New-Item -ItemType Directory -Force -Path dist | Out-Null
-              Copy-Item $candidate.FullName "dist\PlantUmlWebView.wlx64" -Force
-            }
-          }
-          if (!(Test-Path "dist\PlantUmlWebView.wlx64")) {
-            Get-ChildItem -Recurse -File | Select-Object FullName,Length,LastWriteTime | Out-String -Width 2000 | Write-Host
-            throw "Build succeeded but dist\PlantUmlWebView.wlx64 not found."
+          if (!(Test-Path dist\PlantUmlWebView.wlx64)) {
+            Get-ChildItem -Recurse -File . | Select-Object FullName | Out-String -Width 2000 | Write-Host
+            throw "dist\PlantUmlWebView.wlx64 not found. Build failed or output dir differs."
           }
 
-      - name: Stage plugin files
-        shell: pwsh
+      - name: Stage package (flat, installable ZIP)
         run: |
-          $ErrorActionPreference = "Stop"
-          $stage = "package\PlantUmlWebView"
-          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $stage = "package/PlantUmlWebView"
+          Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $stage | Out-Null
 
-          # Mandatory binaries
-          Copy-Item -Force dist\PlantUmlWebView.wlx64 $stage\
+          # Required files at ZIP root:
+          Copy-Item -Force dist\PlantUmlWebView.wlx64     $stage\
+          Copy-Item -Force .\pluginst.inf                 $stage\
+          if (Test-Path .\plantumlwebview.ini) { Copy-Item -Force .\plantumlwebview.ini $stage\ }
+          if (Test-Path .\README.md)          { Copy-Item -Force .\README.md          $stage\ }
+
+          # Loader DLL for runtime bootstrap
           Copy-Item -Force third_party\WebView2\build\native\x64\WebView2Loader.dll $stage\
 
-          # pluginst.inf: copy if present, else create minimal one
-          $infPath = "resources\pluginst.inf"
-          if (Test-Path $infPath) {
-            Copy-Item -Force $infPath $stage\
-          } else {
-            $infLines = @(
-              "[plugininstall]"
-              "defaultextension=puml plantuml uml wsd ws iuml"
-            ) -join "`r`n"
-            $infTarget = Join-Path $stage "pluginst.inf"
-            [System.IO.File]::WriteAllText($infTarget, $infLines, [System.Text.ASCIIEncoding]::new())
-          }
-
-          # plantumlwebview.ini: try common locations, else write defaults
-          $iniCandidates = @(
-            "src\plantumlwebview.ini",
-            "plantumlwebview.ini",
-            "resources\plantumlwebview.ini",
-            ".\plantumlwebview.ini"
-          )
-          $iniSrc = $iniCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          $iniTarget = Join-Path $stage "plantumlwebview.ini"
-
-          if ($iniSrc) {
-            Copy-Item -Force $iniSrc $iniTarget
-          } else {
-            $iniLines = @(
-              "[server]"
-              "url=https://www.plantuml.com/plantuml"
-              ""
-              "[render]"
-              "prefer=svg"
-              ""
-              "[detect]"
-              'string=EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUML"'
-            ) -join "`r`n"
-            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-            [System.IO.File]::WriteAllText($iniTarget, $iniLines, $utf8NoBom)
-          }
-
-          # Optional README
-          if (Test-Path README.md) { Copy-Item -Force README.md $stage\ }
-
-      - name: Create plugin zip (flat root)
-        shell: pwsh
+      - name: Create ZIP (no nesting)
         run: |
-          $ErrorActionPreference = 'Stop'
-      
-          $stage = 'package\PlantUmlWebView'
-          if (-not (Test-Path $stage)) { throw ("Staging folder not found: {0}" -f $stage) }
-      
-          $out = 'PlantUmlWebView.zip'
-          if (Test-Path $out) { Remove-Item -Force $out }
-      
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $out -Force
-      
+          $out = "PlantUmlWebView.zip"
+          Remove-Item -Force $out -ErrorAction SilentlyContinue
+          Compress-Archive -Path package\PlantUmlWebView\* -DestinationPath $out -Force
+
+          # sanity checks: pluginst.inf at root; no nested zips
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [IO.Compression.ZipFile]::OpenRead($out)
           try {
-            $hasInf = $zip.Entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | Select-Object -First 1
-            if (-not $hasInf) {
-              throw ("pluginst.inf is not at the root of {0}" -f $out)
-            }
-      
-            $nested = $zip.Entries | Where-Object { $_.FullName -match '\.zip$' }
+            $entries = $zip.Entries
+            $hasInf  = $entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | Select-Object -First 1
+            $nested  = $entries | Where-Object { $_.FullName -match '\.zip$' } | ForEach-Object { $_.FullName }
+            if (-not $hasInf) { throw "pluginst.inf is not at the root of $out" }
             if ($nested.Count -gt 0) {
-              $names = ($nested | ForEach-Object { $_.FullName }) -join ', '
-              throw ("Nested zip(s) found in {0}: {1}" -f $out, $names)
+              $list = ($nested -join ', ')
+              throw "Nested zip(s) found in $out: $list"
             }
           } finally {
             $zip.Dispose()
           }
 
+      - name: Determine tag
+        id: tag
+        run: |
+          $tag = ""
+          if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}"
+          } elseif ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.tag }}") {
+            $tag = "${{ inputs.tag }}"
+          } else {
+            $sha = "${{ github.sha }}".Substring(0,7)
+            $tag = "manual-$sha"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: PlantUmlWebView
-          path: PlantUmlWebView.zip
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          draft: ${{ github.event.inputs.draft || 'true' }}
+          files: |
+            PlantUmlWebView.zip
+          generate_release_notes: true
