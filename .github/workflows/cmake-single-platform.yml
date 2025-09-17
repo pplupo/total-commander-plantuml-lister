@@ -110,15 +110,20 @@ jobs:
           try {
             $entries = $zip.Entries
             $hasInf  = $entries | Where-Object { $_.FullName -ieq 'pluginst.inf' } | Select-Object -First 1
-            $nested  = $entries | Where-Object { $_.FullName -match '\.zip$' } | ForEach-Object { $_.FullName }
-            if (-not $hasInf) { throw "pluginst.inf is not at the root of ${out}" }
+            $nested  = @($entries | Where-Object { $_.FullName -match '\.zip$' } | Select-Object -ExpandProperty FullName)
+
+            if (-not $hasInf) {
+              throw "pluginst.inf is not at the root of ${out}"
+            }
             if ($nested.Count -gt 0) {
               $list = ($nested -join ', ')
               throw "Nested zip(s) found in ${out}: $list"
             }
-          } finally {
+          }
+          finally {
             $zip.Dispose()
           }
+
 
       - name: Determine tag
         id: tag
