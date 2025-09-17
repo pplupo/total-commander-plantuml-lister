@@ -4,10 +4,6 @@ project(PlantUmlWebView LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(PlantUmlWebView SHARED
-    src/plantuml_wlx_ev2.cpp
-)
-
 # --- stable outputs into <repo>/dist ---
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY  ${CMAKE_SOURCE_DIR}/dist)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY  ${CMAKE_SOURCE_DIR}/dist)
@@ -31,3 +27,4 @@ set_target_properties(PlantUmlWebView PROPERTIES
     PREFIX ""                 # no "lib" prefix anywhere
     SUFFIX ".wlx64"           # produce PlantUmlWebView.wlx64 instead of .dll
 )
+
