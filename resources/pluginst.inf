@@ -1,5 +1,6 @@
 [plugininstall]
-type=wlx
-description=PlantUML WebView (POST renderer; SVG preferred with PNG fallback)
+type=wlx64
 file=PlantUmlWebView.wlx64
+name=PlantUML WebView Lister
+description=PlantUML preview via WebView2 (POST), with Java/server fallback
 defaultextension=puml plantuml uml wsd ws iuml
