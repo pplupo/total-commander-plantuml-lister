@@ -1,4 +1,6 @@
 [plugininstall]
+version=1.0.0
+defaultdir=PlantUmlWebView
 type=wlx64
 file=PlantUmlWebView.wlx64
 name=PlantUML WebView Lister
