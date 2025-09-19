@@ -432,7 +432,7 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
               hud.textContent = 'copied SVG';
               return;
             }
-            const img = root.querySelector('img');
+            const img = document.querySelector('img');
             if (img) {
               const c = document.createElement('canvas');
               c.width = img.naturalWidth; c.height = img.naturalHeight;
