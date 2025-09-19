@@ -4,7 +4,7 @@ import requests
 import xml.etree.ElementTree as ET
 import json
 
-RESOURCES_DIR = os.path.join(os.path.dirname(__file__), '..', 'resources')
+THIRD_PARTY_DIR = os.path.join(os.path.dirname(__file__), '..', 'third_party')
 INI_FILE = os.path.join(os.path.dirname(__file__), '..', 'plantumlwebview.ini')
 GITHUB_API_URL = 'https://api.github.com/repos/plantuml/plantuml/releases'
 SOURCEFORGE_RSS_URL = 'https://sourceforge.net/projects/plantuml.mirror/rss'
@@ -86,7 +86,7 @@ def main():
     print(f"Found latest version: {filename}")
 
     # Check if the latest version is already downloaded
-    new_jar_path = os.path.join(RESOURCES_DIR, filename)
+    new_jar_path = os.path.join(THIRD_PARTY_DIR, filename)
     if os.path.exists(new_jar_path):
         print("Latest version already downloaded.")
     else:
@@ -106,10 +106,10 @@ def main():
     update_ini_file(filename)
 
     # Remove old jar files
-    for item in os.listdir(RESOURCES_DIR):
+    for item in os.listdir(THIRD_PARTY_DIR):
         if item.startswith('plantuml-mit-') and item.endswith('.jar') and item != filename:
             print(f"Removing old jar: {item}")
-            os.remove(os.path.join(RESOURCES_DIR, item))
+            os.remove(os.path.join(THIRD_PARTY_DIR, item))
 
     print("Done.")
 

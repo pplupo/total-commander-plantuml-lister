@@ -37,6 +37,13 @@ jobs:
             This was done automatically by the update-plantuml workflow.
           branch: update-plantuml
           base: main
+      - name: Enable Automerge
+        if: steps.cpr.outputs.pull-request-number
+        uses: peter-evans/enable-pull-request-automerge@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
+          merge-method: squash
       - name: Check outputs
         if: steps.cpr.outputs.pull-request-number
         run: echo "Pull Request Number - ${{ steps.cpr.outputs.pull-request-number }}"
