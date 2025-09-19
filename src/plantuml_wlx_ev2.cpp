@@ -377,7 +377,6 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
   <div id="root"></div>
   <script>
     (function(){
-      document.getElementById('root').textContent = 'Debug: JS is running.';
       const SERVER = "{{SERVER}}".replace(/\/+$/,'');
       const FORMAT = "{{FORMAT}}";
       const UML    = `{{DATA}}`;
@@ -605,9 +604,12 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
                 break;
             } else {
                 lastErr = L"Local Java/JAR rendering failed or Java/JAR not found.";
+                host->initialHtml = BuildErrorHtml(lastErr);
+                produced = true;
+                break;
             }
         } else if (step == L"web") {
-            host->initialHtml = BuildServerHtml(g_serverUrl, preferSvg, text, lastErr);
+            host->initialHtml = BuildServerHtml(g_serverUrl, preferSvg, text, L"");
             produced = true;
             break;
         } else {
