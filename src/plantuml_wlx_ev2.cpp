@@ -377,6 +377,7 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
   <div id="root"></div>
   <script>
     (function(){
+      document.getElementById('root').textContent = 'Debug: JS is running.';
       const SERVER = "{{SERVER}}".replace(/\/+$/,'');
       const FORMAT = "{{FORMAT}}";
       const UML    = `{{DATA}}`;
