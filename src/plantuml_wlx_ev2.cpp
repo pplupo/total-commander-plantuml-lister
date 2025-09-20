@@ -351,8 +351,7 @@ static std::wstring BuildErrorHtml(const std::wstring& message) {
 // Build HTML that fetches from server via POST (fallback path)
 static std::wstring BuildServerHtml(const std::wstring& serverUrl,
                                     bool preferSvg,
-                                    const std::wstring& umlText,
-                                    const std::wstring& prevError)
+                                    const std::wstring& umlText)
 {
     std::wstring html = LR"HTML(<!doctype html>
 <html>
@@ -369,7 +368,6 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
     img, svg { max-width: 100%; height: auto; }
     #hud { position: fixed; top:8px; right:8px; background: color-mix(in oklab, Canvas 80%, CanvasText 20%);
            padding: 4px 10px; border-radius: 999px; font-weight: 600; }
-    .err { padding: 12px 14px; border-radius: 10px; background: color-mix(in oklab, Canvas 85%, red 15%); }
   </style>
 </head>
 <body>
@@ -379,18 +377,9 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
     (function(){
       const SERVER = "{{SERVER}}".replace(/\/+$/,'');
       const FORMAT = "{{FORMAT}}";
-      const UML    = `{{DATA}}`;
-      const PREV_ERROR = `{{PREV_ERROR}}`;
+      const UML    = "{{DATA}}";
       const root   = document.getElementById('root');
       const hud    = document.getElementById('hud');
-
-      if (PREV_ERROR) {
-        const d = document.createElement('div');
-        d.className = 'err';
-        d.style.marginBottom = '12px';
-        d.textContent = 'Local render failed: ' + PREV_ERROR + ' Falling back to server…';
-        root.appendChild(d);
-      }
 
       const endpoint = SERVER + '/' + FORMAT;
       fetch(endpoint, {
@@ -401,23 +390,18 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
         if (!res.ok) throw new Error('HTTP ' + res.status);
         if (FORMAT === 'svg') {
           const svg = await res.text();
-          // Append to root to avoid removing the potential error message div
-          if (root.children.length > 0) root.insertAdjacentHTML('beforeend', svg);
-          else root.innerHTML = svg;
+          root.innerHTML = svg;
         } else {
           const blob = await res.blob();
           const url = URL.createObjectURL(blob);
           const img = new Image();
           img.onload = () => URL.revokeObjectURL(url);
           img.src = url;
-          root.appendChild(img);
+          root.replaceChildren(img);
         }
         hud.textContent = 'done';
       }).catch(err => {
-        const d = document.createElement('div');
-        d.className = 'err';
-        d.textContent = 'Server render error: ' + err.message;
-        root.appendChild(d);
+        root.textContent = 'Render error: ' + err.message;
         hud.textContent = 'error';
       });
 
@@ -425,7 +409,7 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
         if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'c') {
           ev.preventDefault();
           try {
-            const svg = root.querySelector('svg');
+            const svg = document.querySelector('svg');
             if (svg) {
               const s = new XMLSerializer().serializeToString(svg);
               await navigator.clipboard.writeText(s);
@@ -452,24 +436,19 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
     ReplaceAll(html, L"{{SERVER}}", serverUrl);
     ReplaceAll(html, L"{{FORMAT}}", preferSvg ? std::wstring(L"svg") : std::wstring(L"png"));
 
-    auto jsEscape = [](const std::wstring& w) {
-        if (w.empty()) return std::wstring();
-        std::wstring jsEsc; jsEsc.reserve(w.size() + 16);
-        for (wchar_t ch : w) {
-            switch (ch) {
-                case L'\\': jsEsc += L"\\\\"; break;
-                case L'`':  jsEsc += L"\\`";  break; // For JS template literals
-                case L'\n': jsEsc += L"\\n";  break;
-                case L'\r':                break;
-                case L'\t': jsEsc += L"\\t";  break;
-                default:    jsEsc += ch;      break;
-            }
+    // Escape Unicode for embedding as JS string literal
+    std::wstring jsEsc; jsEsc.reserve(umlText.size()+16);
+    for (wchar_t ch : umlText) {
+        switch (ch) {
+            case L'\\': jsEsc += L"\\\\"; break;
+            case L'"':  jsEsc += L"\\\""; break;
+            case L'\n': jsEsc += L"\\n";  break;
+            case L'\r':                break;
+            case L'\t': jsEsc += L"\\t";  break;
+            default:    jsEsc += ch;      break;
         }
-        return jsEsc;
-    };
-
-    ReplaceAll(html, L"{{DATA}}", jsEscape(umlText));
-    ReplaceAll(html, L"{{PREV_ERROR}}", jsEscape(prevError));
+    }
+    ReplaceAll(html, L"{{DATA}}", jsEsc);
     return html;
 }
 
@@ -601,30 +580,23 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
                     host->initialHtml = BuildShellHtmlWithBody(body);
                 }
                 produced = true;
-                break;
+                break; // Success, so we're done.
             } else {
-                lastErr = L"Local Java/JAR rendering failed or Java/JAR not found.";
+                lastErr = L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.";
                 host->initialHtml = BuildErrorHtml(lastErr);
-                produced = true;
-                break;
+                produced = true; // We "produced" an error page.
+                break; // Failure, so we're done.
             }
         } else if (step == L"web") {
-            host->initialHtml = BuildServerHtml(g_serverUrl, preferSvg, text, L"");
+            host->initialHtml = BuildServerHtml(g_serverUrl, preferSvg, text);
             produced = true;
-            break;
-        } else {
-            // ignore unknown tokens
+            break; // We can only try, so we're done.
         }
+        // Unrecognized steps are ignored
     }
 
     if (!produced) {
-        if (order.size() == 1 && order[0] == L"java") {
-            host->initialHtml = BuildErrorHtml(lastErr.empty() ? L"Java-only mode selected, but Java/JAR not available." : lastErr);
-        } else if (order.size() == 1 && order[0] == L"web") {
-            host->initialHtml = BuildErrorHtml(L"Web-only mode selected, cannot proceed (unexpected).");
-        } else {
-            host->initialHtml = BuildErrorHtml(L"No valid render mode produced output.");
-        }
+        host->initialHtml = BuildErrorHtml(L"No valid renderer specified in `render.order` of INI file. Check plantumlwebview.ini.");
     }
 
     InitWebView(host);
