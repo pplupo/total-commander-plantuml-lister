@@ -440,6 +440,27 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     return true;
 }
 
+static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
+                                    bool preferSvg,
+                                    std::wstring& outHtml) {
+    std::wstring svgOut;
+    std::vector<unsigned char> pngOut;
+    if (!RunPlantUmlJar(umlText, preferSvg, svgOut, pngOut)) {
+        return false;
+    }
+
+    if (preferSvg) {
+        outHtml = BuildShellHtmlWithBody(svgOut);
+    } else {
+        const std::string b64 = Base64(pngOut);
+        std::wstring body = L"<img alt=\"diagram\" src=\"data:image/png;base64,";
+        body += FromUtf8(b64);
+        body += L"\"/>";
+        outHtml = BuildShellHtmlWithBody(body);
+    }
+    return true;
+}
+
 // Build minimal HTML wrapper with injected BODY (svg markup or <img src="data:...">)
 static std::wstring BuildShellHtmlWithBody(const std::wstring& body) {
     std::wstring html = LR"HTML(<!doctype html>
@@ -534,15 +555,29 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
       const hud    = document.getElementById('hud');
 
       const endpoint = SERVER + '/' + FORMAT;
+
+      const notifyHost = (tag, detail) => {
+        if (!tag) return;
+        if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) {
+          try {
+            const payload = detail ? `${tag}:${detail}` : `${tag}:`;
+            window.chrome.webview.postMessage(payload);
+          } catch (e) {}
+        }
+      };
+
+      notifyHost('web-fetch', `start endpoint=${endpoint}, format=${FORMAT}, umlChars=${UML.length}`);
       fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: UML
       }).then(async res => {
+        notifyHost('web-fetch', `response status=${res.status}, ok=${res.ok}, contentType=${res.headers.get('content-type') || ''}`);
         if (!res.ok) throw new Error('HTTP ' + res.status);
         if (FORMAT === 'svg') {
           const svg = await res.text();
           root.innerHTML = svg;
+          notifyHost('web-fetch', `success format=svg, svgLength=${svg.length}`);
         } else {
           const blob = await res.blob();
           const url = URL.createObjectURL(blob);
@@ -550,11 +585,16 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
           img.onload = () => URL.revokeObjectURL(url);
           img.src = url;
           root.replaceChildren(img);
+          notifyHost('web-fetch', `success format=png, blobSize=${blob.size}`);
         }
         hud.textContent = 'done';
       }).catch(err => {
-        root.textContent = 'Render error: ' + err.message;
+        const message = err && err.message ? err.message : String(err);
+        const name = err && err.name ? err.name : 'Error';
+        root.textContent = 'Render error: ' + message;
         hud.textContent = 'error';
+        notifyHost('web-fetch', `failure name=${name}, message=${message}`);
+        notifyHost('web-error', `${message}`);
       });
 
       document.addEventListener('keydown', async ev => {
@@ -611,6 +651,8 @@ struct Host {
     std::atomic<long> refs{1};
     std::atomic<bool> closing{false};
 
+    std::mutex stateMutex;
+
     HWND hwnd = nullptr;
     HINSTANCE hInst = nullptr;
     HMODULE   hWvLoader = nullptr;
@@ -618,9 +660,90 @@ struct Host {
     ComPtr<ICoreWebView2Environment> env;
     ComPtr<ICoreWebView2Controller>  ctrl;
     ComPtr<ICoreWebView2>            web;
+    EventRegistrationToken           webMessageToken{};
+    bool                             webMessageRegistered = false;
+    EventRegistrationToken           navCompletedToken{};
+    bool                             navCompletedRegistered = false;
 
     std::wstring initialHtml; // what we will NavigateToString()
+
+    std::wstring umlText;
+    bool preferSvg = true;
+    std::vector<std::wstring> fallbackSteps;
+    std::wstring fallbackFailureMessage;
+    std::atomic<bool> fallbackTriggered{false};
 };
+
+static void HostNavigateToInitialHtml(Host* host) {
+    if (!host || !host->web) return;
+    std::wstring html;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        html = host->initialHtml;
+    }
+    if (!html.empty()) {
+        AppendLog(L"HostNavigateToInitialHtml: navigating with HTML length=" + std::to_wstring(html.size()));
+        host->web->NavigateToString(html.c_str());
+    }
+}
+
+static void HostTriggerFallback(Host* host, const std::wstring& reason) {
+    if (!host) return;
+    bool expected = false;
+    if (!host->fallbackTriggered.compare_exchange_strong(expected, true)) {
+        AppendLog(L"HostFallback: already triggered, ignoring duplicate request");
+        return;
+    }
+
+    AppendLog(L"HostFallback: triggered due to " + reason);
+
+    std::vector<std::wstring> steps;
+    std::wstring configuredFinalError;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        steps = host->fallbackSteps;
+        configuredFinalError = host->fallbackFailureMessage;
+    }
+
+    AppendLog(L"HostFallback: steps available=" + std::to_wstring(steps.size()) +
+               L", configured fallback message present=" + (configuredFinalError.empty() ? L"false" : L"true"));
+
+    const std::wstring javaError = L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.";
+    std::wstring finalErr = configuredFinalError.empty() ? (reason.empty() ? L"Renderer error." : reason)
+                                                         : configuredFinalError;
+    for (const auto& step : steps) {
+        AppendLog(L"HostFallback: considering step '" + step + L"'");
+        if (step == L"java") {
+            std::wstring html;
+            if (BuildHtmlFromJavaRender(host->umlText, host->preferSvg, html)) {
+                AppendLog(L"HostFallback: Java render succeeded");
+                {
+                    std::lock_guard<std::mutex> lock(host->stateMutex);
+                    host->initialHtml = html;
+                }
+                HostNavigateToInitialHtml(host);
+                return;
+            }
+            AppendLog(L"HostFallback: Java render failed");
+            AppendLog(L"HostFallback: java error message -> " + javaError);
+        } else if (!step.empty()) {
+            AppendLog(L"HostFallback: unsupported fallback step '" + step + L"'");
+        }
+    }
+
+    if (steps.empty()) {
+        AppendLog(L"HostFallback: no fallback steps available");
+    } else {
+        AppendLog(L"HostFallback: no fallback step succeeded");
+    }
+    AppendLog(L"HostFallback: displaying error message -> " + finalErr);
+    std::wstring html = BuildErrorHtml(finalErr);
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        host->initialHtml = html;
+    }
+    HostNavigateToInitialHtml(host);
+}
 
 static void HostAddRef(Host* host) {
     if (host) host->refs.fetch_add(1, std::memory_order_relaxed);
@@ -650,6 +773,16 @@ static LRESULT CALLBACK HostWndProc(HWND h, UINT m, WPARAM w, LPARAM l){
         if(host){
             host->closing.store(true, std::memory_order_release);
             host->hwnd = nullptr;
+            if (host->web && host->webMessageRegistered) {
+                host->web->remove_WebMessageReceived(host->webMessageToken);
+                host->webMessageRegistered = false;
+                HostRelease(host);
+            }
+            if (host->web && host->navCompletedRegistered) {
+                host->web->remove_NavigationCompleted(host->navCompletedToken);
+                host->navCompletedRegistered = false;
+                HostRelease(host);
+            }
             if(host->ctrl) host->ctrl->Close();
             if(host->hWvLoader) FreeLibrary(host->hWvLoader);
             host->ctrl.Reset();
@@ -740,10 +873,82 @@ static void InitWebView(struct Host* host){
                             }
                             RECT rc; GetClientRect(host->hwnd, &rc);
                             host->ctrl->put_Bounds(rc);
-                            if (!host->initialHtml.empty()){
-                                AppendLog(L"InitWebView: navigating to initial HTML (" + std::to_wstring(host->initialHtml.size()) + L" chars)");
-                                host->web->NavigateToString(host->initialHtml.c_str());
+                            if (host->web) {
+                                HostAddRef(host);
+                                EventRegistrationToken navToken{};
+                                HRESULT hrNav = host->web->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                                    [host](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args)->HRESULT{
+                                        std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                                        if(!host || host->closing.load(std::memory_order_acquire)){
+                                            return S_OK;
+                                        }
+                                        UINT64 navId = 0;
+                                        if (args) args->get_NavigationId(&navId);
+                                        BOOL isSuccess = FALSE;
+                                        if (args) args->get_IsSuccess(&isSuccess);
+                                        COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                                        if (args) args->get_WebErrorStatus(&status);
+                                        HRESULT extended = S_OK;
+                                        if (args) args->get_ExtendedError(&extended);
+                                        wchar_t extBuf[32];
+                                        swprintf(extBuf, 32, L"0x%08X", extended);
+                                        std::wstringstream os;
+                                        os << L"InitWebView: NavigationCompleted id=" << navId
+                                           << L", success=" << (isSuccess ? L"true" : L"false")
+                                           << L", webErrorStatus=" << static_cast<int>(status)
+                                           << L", extendedError=" << extBuf;
+                                        AppendLog(os.str());
+                                        return S_OK;
+                                    }).Get(), &navToken);
+                                if (SUCCEEDED(hrNav)) {
+                                    host->navCompletedToken = navToken;
+                                    host->navCompletedRegistered = true;
+                                } else {
+                                    AppendLog(L"InitWebView: add_NavigationCompleted failed with HRESULT=" + std::to_wstring(hrNav));
+                                    HostRelease(host);
+                                }
+                                HostAddRef(host);
+                                EventRegistrationToken token{};
+                                HRESULT hrWebMsg = host->web->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                    [host](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args)->HRESULT{
+                                        std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                                        if(!host || host->closing.load(std::memory_order_acquire)){
+                                            return S_OK;
+                                        }
+                                        LPWSTR raw = nullptr;
+                                        if (SUCCEEDED(args->TryGetWebMessageAsString(&raw)) && raw) {
+                                            std::wstring message(raw);
+                                            CoTaskMemFree(raw);
+                                            size_t colon = message.find(L':');
+                                            std::wstring tag = (colon == std::wstring::npos) ? message : message.substr(0, colon);
+                                            std::wstring detail = (colon == std::wstring::npos) ? std::wstring() : message.substr(colon + 1);
+                                            if (tag == L"web-error") {
+                                                if (detail.empty()) detail = L"web renderer error";
+                                                AppendLog(L"InitWebView: WebView reported error -> " + detail);
+                                                HostTriggerFallback(host, detail);
+                                            } else if (tag == L"web-fetch") {
+                                                AppendLog(L"InitWebView: Web fetch detail -> " + detail);
+                                            } else if (!message.empty()) {
+                                                AppendLog(L"InitWebView: Web message -> " + message);
+                                            }
+                                        }
+                                        return S_OK;
+                                    }).Get(), &token);
+                                if (SUCCEEDED(hrWebMsg)) {
+                                    host->webMessageToken = token;
+                                    host->webMessageRegistered = true;
+                                } else {
+                                    AppendLog(L"InitWebView: add_WebMessageReceived failed with HRESULT=" + std::to_wstring(hrWebMsg));
+                                    HostRelease(host);
+                                }
                             }
+                            {
+                                std::lock_guard<std::mutex> lock(host->stateMutex);
+                                if (!host->initialHtml.empty()){
+                                    AppendLog(L"InitWebView: navigating to initial HTML (" + std::to_wstring(host->initialHtml.size()) + L" chars)");
+                                }
+                            }
+                            HostNavigateToInitialHtml(host);
                             return S_OK;
                         }).Get());
                 if(FAILED(hrCtrl)){
@@ -790,6 +995,12 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
     const bool preferSvg = (ToLowerTrim(g_prefer) == L"svg");
     AppendLog(L"ListLoadW: preferSvg=" + std::wstring(preferSvg ? L"true" : L"false"));
 
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        host->umlText = text;
+        host->preferSvg = preferSvg;
+    }
+
     // Decide render path by order
     const std::vector<std::wstring> order = SplitOrder(g_order.empty() ? L"java,web" : g_order);
     {
@@ -804,32 +1015,33 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
     bool produced = false;
     std::wstring lastErr;
 
-    for (const auto& step : order) {
+    for (size_t idx = 0; idx < order.size(); ++idx) {
+        const auto& step = order[idx];
         AppendLog(L"ListLoadW: considering renderer step '" + step + L"'");
         if (step == L"java") {
-            std::wstring svgOut;
-            std::vector<unsigned char> pngOut;
             AppendLog(L"ListLoadW: attempting local Java render with jar=" + (g_jarPath.empty() ? std::wstring(L"<auto>") : g_jarPath));
-            if (RunPlantUmlJar(text, preferSvg, svgOut, pngOut)) {
-                if (preferSvg) {
-                    host->initialHtml = BuildShellHtmlWithBody(svgOut);
-                    AppendLog(L"ListLoadW: local render succeeded (SVG)");
-                } else {
-                    const std::string b64 = Base64(pngOut);
-                    std::wstring body = L"<img alt=\"diagram\" src=\"data:image/png;base64,";
-                    body += FromUtf8(b64); body += L"\"/>";
-                    host->initialHtml = BuildShellHtmlWithBody(body);
-                    AppendLog(L"ListLoadW: local render succeeded (PNG)");
+            std::wstring html;
+            if (BuildHtmlFromJavaRender(text, preferSvg, html)) {
+                {
+                    std::lock_guard<std::mutex> lock(host->stateMutex);
+                    host->initialHtml = html;
                 }
+                AppendLog(L"ListLoadW: local render succeeded" + std::wstring(preferSvg ? L" (SVG)" : L" (PNG)"));
                 produced = true;
                 break; // Success, so we're done.
             } else {
                 lastErr = L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.";
+                AppendLog(L"ListLoadW: java error message -> " + lastErr);
                 AppendLog(L"ListLoadW: local render failed");
                 continue; // Try next step in the order.
             }
         } else if (step == L"web") {
-            host->initialHtml = BuildServerHtml(g_serverUrl, preferSvg, text);
+            {
+                std::lock_guard<std::mutex> lock(host->stateMutex);
+                host->initialHtml = BuildServerHtml(g_serverUrl, preferSvg, text);
+                host->fallbackSteps.assign(order.begin() + idx + 1, order.end());
+                host->fallbackFailureMessage = lastErr;
+            }
             AppendLog(L"ListLoadW: prepared web fallback HTML with server=" + g_serverUrl);
             produced = true;
             break; // We can only try, so we're done.
@@ -842,9 +1054,11 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
     if (!produced) {
         if (!lastErr.empty()) {
             host->initialHtml = BuildErrorHtml(lastErr);
+            AppendLog(L"ListLoadW: error message -> " + lastErr);
             AppendLog(L"ListLoadW: showing error HTML");
         } else {
             host->initialHtml = BuildErrorHtml(L"No valid renderer specified in `render.order` of INI file. Check plantumlwebview.ini.");
+            AppendLog(L"ListLoadW: error message -> No valid renderer specified in `render.order` of INI file. Check plantumlwebview.ini.");
             AppendLog(L"ListLoadW: no renderer produced output");
         }
     }
