@@ -15,6 +15,7 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <cwchar>
 
@@ -567,6 +568,9 @@ static std::wstring BuildServerHtml(const std::wstring& serverUrl,
 static const wchar_t* kWndClass = L"PumlWebViewHost";
 
 struct Host {
+    std::atomic<long> refs{1};
+    std::atomic<bool> closing{false};
+
     HWND hwnd = nullptr;
     HINSTANCE hInst = nullptr;
     HMODULE   hWvLoader = nullptr;
@@ -577,6 +581,17 @@ struct Host {
 
     std::wstring initialHtml; // what we will NavigateToString()
 };
+
+static void HostAddRef(Host* host) {
+    if (host) host->refs.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void HostRelease(Host* host) {
+    if (!host) return;
+    if (host->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        delete host;
+    }
+}
 
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
     PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions*,
@@ -593,9 +608,14 @@ static LRESULT CALLBACK HostWndProc(HWND h, UINT m, WPARAM w, LPARAM l){
     if(m==WM_NCDESTROY){
         auto* host = reinterpret_cast<Host*>(GetWindowLongPtrW(h, GWLP_USERDATA));
         if(host){
+            host->closing.store(true, std::memory_order_release);
+            host->hwnd = nullptr;
             if(host->ctrl) host->ctrl->Close();
             if(host->hWvLoader) FreeLibrary(host->hWvLoader);
-            delete host;
+            host->ctrl.Reset();
+            host->web.Reset();
+            host->env.Reset();
+            HostRelease(host);
         }
         SetWindowLongPtrW(h, GWLP_USERDATA, 0);
     }
@@ -632,18 +652,30 @@ static void InitWebView(struct Host* host){
     }
 
     AppendLog(L"InitWebView: creating environment");
-    fn(nullptr, nullptr, nullptr,
+    HostAddRef(host);
+    HRESULT hrEnv = fn(nullptr, nullptr, nullptr,
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [host](HRESULT hr, ICoreWebView2Environment* env)->HRESULT{
+                std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                if(!host || host->closing.load(std::memory_order_acquire)){
+                    AppendLog(L"InitWebView: host closing before environment callback");
+                    return S_OK;
+                }
                 if(FAILED(hr) || !env){
                     AppendLog(L"InitWebView: environment creation failed with HRESULT=" + std::to_wstring(hr));
                     return S_OK;
                 }
                 AppendLog(L"InitWebView: environment ready");
                 host->env = env;
-                env->CreateCoreWebView2Controller(host->hwnd,
+                HostAddRef(host);
+                HRESULT hrCtrl = env->CreateCoreWebView2Controller(host->hwnd,
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                         [host](HRESULT hr, ICoreWebView2Controller* ctrl)->HRESULT{
+                            std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                            if(!host || host->closing.load(std::memory_order_acquire)){
+                                AppendLog(L"InitWebView: host closing before controller callback");
+                                return S_OK;
+                            }
                             if(FAILED(hr) || !ctrl){
                                 AppendLog(L"InitWebView: controller creation failed with HRESULT=" + std::to_wstring(hr));
                                 return S_OK;
@@ -656,6 +688,10 @@ static void InitWebView(struct Host* host){
                                 return S_OK;
                             }
                             AppendLog(L"InitWebView: CoreWebView2 obtained");
+                            if(!host->hwnd){
+                                AppendLog(L"InitWebView: window destroyed before bounds update");
+                                return S_OK;
+                            }
                             RECT rc; GetClientRect(host->hwnd, &rc);
                             host->ctrl->put_Bounds(rc);
                             if (!host->initialHtml.empty()){
@@ -664,9 +700,18 @@ static void InitWebView(struct Host* host){
                             }
                             return S_OK;
                         }).Get());
+                if(FAILED(hrCtrl)){
+                    AppendLog(L"InitWebView: CreateCoreWebView2Controller call failed with HRESULT=" + std::to_wstring(hrCtrl));
+                    HostRelease(host);
+                }
                 return S_OK;
             }).Get());
+    if(FAILED(hrEnv)){
+        AppendLog(L"InitWebView: CreateCoreWebView2EnvironmentWithOptions call failed with HRESULT=" + std::to_wstring(hrEnv));
+        HostRelease(host);
+    }
 }
+
 
 // ---------------------- WLX exports ----------------------
 extern "C" {
@@ -687,6 +732,11 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
     host->hwnd  = CreateWindowExW(0, kWndClass, L"",
                                   WS_CHILD|WS_VISIBLE, 0,0,0,0,
                                   ParentWin, nullptr, host->hInst, nullptr);
+    if(!host->hwnd){
+        AppendLog(L"ListLoadW: CreateWindowExW failed with error " + std::to_wstring(GetLastError()));
+        HostRelease(host);
+        return nullptr;
+    }
     SetWindowLongPtrW(host->hwnd, GWLP_USERDATA, (LONG_PTR)host);
 
     const std::wstring text = ReadFileUtf16OrAnsi(FileToLoad);
