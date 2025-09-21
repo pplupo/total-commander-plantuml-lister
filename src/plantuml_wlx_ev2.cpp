@@ -174,8 +174,18 @@ static void LoadConfigIfNeeded() {
         if (!utf8.empty()) g_detectA = utf8;
     }
 
-    if (GetPrivateProfileStringW(L"plantuml", L"jar", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_jarPath = buf;
-    if (GetPrivateProfileStringW(L"plantuml", L"java", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_javaPath = buf;
+    if (GetPrivateProfileStringW(L"plantuml", L"jar", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
+        g_jarPath = buf;
+        if (PathIsRelativeW(g_jarPath.c_str())) {
+            g_jarPath = moduleDir + L"\\" + g_jarPath;
+        }
+    }
+    if (GetPrivateProfileStringW(L"plantuml", L"java", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
+        g_javaPath = buf;
+        if (PathIsRelativeW(g_javaPath.c_str())) {
+            g_javaPath = moduleDir + L"\\" + g_javaPath;
+        }
+    }
     DWORD tmo = GetPrivateProfileIntW(L"plantuml", L"timeout_ms", 0, ini.c_str());
     if (tmo > 0) g_jarTimeoutMs = tmo;
 
@@ -186,10 +196,20 @@ static void LoadConfigIfNeeded() {
         }
     }
 
-    // If jar is not explicitly set, auto-try "plantuml.jar" next to the plugin
     if (g_jarPath.empty()) {
-        const std::wstring guess = GetModuleDir() + L"\\plantuml.jar";
-        if (FileExistsW(guess)) g_jarPath = guess;
+        const std::wstring dir = GetModuleDir();
+        const std::wstring guess = dir + L"\\plantuml.jar";
+        if (FileExistsW(guess)) {
+            g_jarPath = guess;
+        } else {
+            WIN32_FIND_DATAW fd{};
+            const std::wstring pattern = dir + L"\\plantuml*.jar";
+            HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                g_jarPath = dir + L"\\" + fd.cFileName;
+                FindClose(hFind);
+            }
+        }
     }
 
     std::wstringstream cfg;
@@ -338,7 +358,7 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     DWORD written = 0;
     if (!umlUtf8.empty()) {
         if (!WriteFile(hInW, umlUtf8.data(), (DWORD)umlUtf8.size(), &written, nullptr)) {
-            AppendLog(L"RunPlantUmlJar: failed to write UML to stdin");
+            AppendLog(L"RunPlantUmlJar: failed to write UML to stdin (error=" + std::to_wstring(GetLastError()) + L")");
         }
     }
     CloseHandle(hInW); // signal EOF
