@@ -152,6 +152,30 @@ static std::wstring ReadFileUtf16OrAnsi(const wchar_t* path) {
     return w;
 }
 
+static bool TryAutoDetectPlantUmlJar(std::wstring& outPath) {
+    const std::wstring dir = GetModuleDir();
+    const std::wstring exact = dir + L"\\plantuml.jar";
+    if (FileExistsW(exact)) {
+        outPath = exact;
+        return true;
+    }
+
+    WIN32_FIND_DATAW fd{};
+    const std::wstring pattern = dir + L"\\plantuml*.jar";
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                outPath = dir + L"\\" + fd.cFileName;
+                FindClose(hFind);
+                return true;
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+    return false;
+}
+
 static void LoadConfigIfNeeded() {
     if (g_cfgLoaded) return;
     g_cfgLoaded = true;
@@ -196,19 +220,15 @@ static void LoadConfigIfNeeded() {
         }
     }
 
-    if (g_jarPath.empty()) {
-        const std::wstring dir = GetModuleDir();
-        const std::wstring guess = dir + L"\\plantuml.jar";
-        if (FileExistsW(guess)) {
-            g_jarPath = guess;
-        } else {
-            WIN32_FIND_DATAW fd{};
-            const std::wstring pattern = dir + L"\\plantuml*.jar";
-            HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
-            if (hFind != INVALID_HANDLE_VALUE) {
-                g_jarPath = dir + L"\\" + fd.cFileName;
-                FindClose(hFind);
-            }
+    bool needDetectJar = g_jarPath.empty();
+    if (!g_jarPath.empty() && !FileExistsW(g_jarPath)) {
+        AppendLog(L"LoadConfig: configured jar not found at " + g_jarPath + L". Attempting auto-detect.");
+        needDetectJar = true;
+    }
+    if (needDetectJar) {
+        std::wstring detected;
+        if (TryAutoDetectPlantUmlJar(detected)) {
+            g_jarPath.swap(detected);
         }
     }
 
@@ -248,8 +268,8 @@ static std::vector<std::wstring> SplitOrder(const std::wstring& s) {
 static bool FindJavaExecutable(std::wstring& outPath) {
     if (!g_javaPath.empty() && FileExistsW(g_javaPath)) { outPath = g_javaPath; return true; }
     wchar_t found[MAX_PATH]{};
-    if (SearchPathW(nullptr, L"javaw.exe", nullptr, MAX_PATH, found, nullptr)) { outPath = found; return true; }
     if (SearchPathW(nullptr, L"java.exe", nullptr, MAX_PATH, found, nullptr))  { outPath = found; return true; }
+    if (SearchPathW(nullptr, L"javaw.exe", nullptr, MAX_PATH, found, nullptr)) { outPath = found; return true; }
     return false;
 }
 
