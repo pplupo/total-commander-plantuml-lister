@@ -583,9 +583,7 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
                 break; // Success, so we're done.
             } else {
                 lastErr = L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.";
-                host->initialHtml = BuildErrorHtml(lastErr);
-                produced = true; // We "produced" an error page.
-                break; // Failure, so we're done.
+                continue; // Try next step in the order.
             }
         } else if (step == L"web") {
             host->initialHtml = BuildServerHtml(g_serverUrl, preferSvg, text);
@@ -596,7 +594,11 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
     }
 
     if (!produced) {
-        host->initialHtml = BuildErrorHtml(L"No valid renderer specified in `render.order` of INI file. Check plantumlwebview.ini.");
+        if (!lastErr.empty()) {
+            host->initialHtml = BuildErrorHtml(lastErr);
+        } else {
+            host->initialHtml = BuildErrorHtml(L"No valid renderer specified in `render.order` of INI file. Check plantumlwebview.ini.");
+        }
     }
 
     InitWebView(host);
