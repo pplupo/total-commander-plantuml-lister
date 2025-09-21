@@ -196,7 +196,6 @@ static void LoadConfigIfNeeded() {
         }
     }
 
-    // If jar is not explicitly set, auto-try common filenames next to the plugin
     if (g_jarPath.empty()) {
         const std::wstring dir = GetModuleDir();
         const std::wstring guess = dir + L"\\plantuml.jar";
@@ -732,6 +731,7 @@ static void InitWebView(struct Host* host){
         HostRelease(host);
     }
 }
+
 
 // ---------------------- WLX exports ----------------------
 extern "C" {
