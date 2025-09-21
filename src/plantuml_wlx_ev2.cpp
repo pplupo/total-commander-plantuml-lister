@@ -344,10 +344,10 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     }
 
     // Make only the child side inheritable
-    SetHandleInformation(hInW,  HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    SetHandleInformation(hOutR, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-    SetHandleInformation(hInR,  HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(hOutW, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hInR,  HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(hOutW, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+    SetHandleInformation(hInW,  HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(hOutR, HANDLE_FLAG_INHERIT, 0);
 
     std::wstringstream cmd;
     cmd << L"\"" << javaExe << L"\" -Djava.awt.headless=true -jar \"" << g_jarPath
@@ -675,9 +675,15 @@ static void EnsureWndClass(){
 
 static void InitWebView(struct Host* host){
     AppendLog(L"InitWebView: loading WebView2Loader.dll");
-    host->hWvLoader = LoadLibraryW(L"WebView2Loader.dll");
+    std::wstring loaderPath = GetModuleDir() + L"\\WebView2Loader.dll";
+    host->hWvLoader = LoadLibraryW(loaderPath.c_str());
     if(!host->hWvLoader){
-        AppendLog(L"InitWebView: WebView2Loader.dll not found");
+        AppendLog(L"InitWebView: WebView2Loader.dll not found at " + loaderPath +
+                  L" (error=" + std::to_wstring(GetLastError()) + L")");
+        host->hWvLoader = LoadLibraryW(L"WebView2Loader.dll");
+    }
+    if(!host->hWvLoader){
+        AppendLog(L"InitWebView: WebView2Loader.dll load failed");
         CreateWindowW(L"STATIC", L"WebView2 Runtime not found. Install Edge WebView2 Runtime.", WS_CHILD|WS_VISIBLE|SS_CENTER,
                       0,0,0,0, host->hwnd, nullptr, host->hInst, nullptr);
         return;
