@@ -15,6 +15,8 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include <mutex>
+#include <cwchar>
 
 #include "WebView2.h"
 
@@ -30,9 +32,54 @@ static std::string  g_detectA   = R"(EXT="PUML" | EXT="PLANTUML" | EXT="UML" | E
 
 static std::wstring g_jarPath;                      // If empty: auto-detect moduleDir\plantuml.jar
 static std::wstring g_javaPath;                     // Optional explicit java[w].exe
+static std::wstring g_logPath;                      // If empty: moduleDir\plantumlwebview.log
 static DWORD        g_jarTimeoutMs = 8000;
 
 static bool         g_cfgLoaded = false;
+
+static std::mutex   g_logMutex;
+static bool         g_logSessionStarted = false;
+
+static std::string ToUtf8(const std::wstring& w);
+
+static std::wstring FormatTimestamp() {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t buf[64];
+    swprintf(buf, 64, L"[%04u-%02u-%02u %02u:%02u:%02u.%03u] ",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    return buf;
+}
+
+static void AppendLog(const std::wstring& message) {
+    if (g_logPath.empty()) return;
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    if (!g_logSessionStarted) {
+        LARGE_INTEGER size{};
+        if (GetFileSizeEx(h, &size) && size.QuadPart > 0) {
+            std::string sep = "\r\n";
+            DWORD written = 0;
+            WriteFile(h, sep.c_str(), (DWORD)sep.size(), &written, nullptr);
+        }
+        std::wstring header = FormatTimestamp() + L"--- PlantUML WebView session start ---\r\n";
+        std::string headerUtf8 = ToUtf8(header);
+        if (!headerUtf8.empty()) {
+            DWORD written = 0;
+            WriteFile(h, headerUtf8.data(), (DWORD)headerUtf8.size(), &written, nullptr);
+        }
+        g_logSessionStarted = true;
+    }
+    std::wstring line = FormatTimestamp() + message + L"\r\n";
+    std::string utf8 = ToUtf8(line);
+    if (!utf8.empty()) {
+        DWORD written = 0;
+        WriteFile(h, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
+    }
+    CloseHandle(h);
+}
 
 // ---------------------- Helpers ----------------------
 static std::wstring GetModuleDir() {
@@ -75,11 +122,18 @@ static std::string ToUtf8(const std::wstring& w) {
 
 static std::wstring ReadFileUtf16OrAnsi(const wchar_t* path) {
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return L"";
+    if (h == INVALID_HANDLE_VALUE) {
+        AppendLog(L"ReadFileUtf16OrAnsi: failed to open file " + std::wstring(path ? path : L"<null>") +
+                  L" (error=" + std::to_wstring(GetLastError()) + L")");
+        return L"";
+    }
     DWORD size = GetFileSize(h, nullptr);
     std::string bytes; bytes.resize(size ? size : 0);
     DWORD read = 0;
-    if (size && ReadFile(h, bytes.data(), size, &read, nullptr) && read == size) {}
+    if (size && (!ReadFile(h, bytes.data(), size, &read, nullptr) || read != size)) {
+        AppendLog(L"ReadFileUtf16OrAnsi: short read for file " + std::wstring(path ? path : L"<null>") +
+                  L" (wanted=" + std::to_wstring(size) + L", got=" + std::to_wstring(read) + L")");
+    }
     CloseHandle(h);
 
     if (bytes.size() >= 2 && (unsigned char)bytes[0]==0xFF && (unsigned char)bytes[1]==0xFE) {
@@ -101,7 +155,11 @@ static void LoadConfigIfNeeded() {
     if (g_cfgLoaded) return;
     g_cfgLoaded = true;
 
-    const std::wstring ini = GetModuleDir() + L"\\plantumlwebview.ini";
+    const std::wstring moduleDir = GetModuleDir();
+    const std::wstring ini = moduleDir + L"\\plantumlwebview.ini";
+    if (g_logPath.empty()) {
+        g_logPath = moduleDir + L"\\plantumlwebview.log";
+    }
     wchar_t buf[2048];
 
     if (GetPrivateProfileStringW(L"server", L"url", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_serverUrl = buf;
@@ -120,11 +178,28 @@ static void LoadConfigIfNeeded() {
     DWORD tmo = GetPrivateProfileIntW(L"plantuml", L"timeout_ms", 0, ini.c_str());
     if (tmo > 0) g_jarTimeoutMs = tmo;
 
+    if (GetPrivateProfileStringW(L"debug", L"log", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
+        g_logPath = buf;
+        if (PathIsRelativeW(g_logPath.c_str())) {
+            g_logPath = moduleDir + L"\\" + g_logPath;
+        }
+    }
+
     // If jar is not explicitly set, auto-try "plantuml.jar" next to the plugin
     if (g_jarPath.empty()) {
         const std::wstring guess = GetModuleDir() + L"\\plantuml.jar";
         if (FileExistsW(guess)) g_jarPath = guess;
     }
+
+    std::wstringstream cfg;
+    cfg << L"Config loaded. server=" << g_serverUrl
+        << L", prefer=" << g_prefer
+        << L", order=" << g_order
+        << L", jar=" << (g_jarPath.empty() ? L"<auto>" : g_jarPath)
+        << L", java=" << (g_javaPath.empty() ? L"<auto>" : g_javaPath)
+        << L", timeoutMs=" << g_jarTimeoutMs
+        << L", log=" << g_logPath;
+    AppendLog(cfg.str());
 }
 
 static std::wstring ToLowerTrim(const std::wstring& in) {
@@ -191,10 +266,25 @@ static std::string Base64(const std::vector<unsigned char>& in) {
 static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
                            std::wstring& outSvg, std::vector<unsigned char>& outPng)
 {
-    if (g_jarPath.empty() || !FileExistsW(g_jarPath)) return false;
+    AppendLog(L"RunPlantUmlJar: start");
+
+    if (g_jarPath.empty()) {
+        AppendLog(L"RunPlantUmlJar: jar path is empty");
+        return false;
+    }
+    if (!FileExistsW(g_jarPath)) {
+        AppendLog(L"RunPlantUmlJar: jar not found at " + g_jarPath);
+        return false;
+    }
 
     std::wstring javaExe;
-    if (!FindJavaExecutable(javaExe)) return false;
+    if (!FindJavaExecutable(javaExe)) {
+        AppendLog(L"RunPlantUmlJar: Java executable not found");
+        return false;
+    }
+
+    AppendLog(L"RunPlantUmlJar: using java executable " + javaExe);
+
 
     std::wstring fmt = preferSvg ? L"-tsvg" : L"-tpng";
 
@@ -202,8 +292,15 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     HANDLE hInR=nullptr,  hInW=nullptr;
     HANDLE hOutR=nullptr, hOutW=nullptr;
 
-    if (!CreatePipe(&hInR, &hInW, &sa, 0)) return false;
-    if (!CreatePipe(&hOutR, &hOutW, &sa, 0)) { CloseHandle(hInR); CloseHandle(hInW); return false; }
+    if (!CreatePipe(&hInR, &hInW, &sa, 0)) {
+        AppendLog(L"RunPlantUmlJar: failed to create stdin pipe");
+        return false;
+    }
+    if (!CreatePipe(&hOutR, &hOutW, &sa, 0)) {
+        AppendLog(L"RunPlantUmlJar: failed to create stdout pipe");
+        CloseHandle(hInR); CloseHandle(hInW);
+        return false;
+    }
 
     // Make only the child side inheritable
     SetHandleInformation(hInW,  HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
@@ -230,6 +327,7 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     CloseHandle(hInR);
 
     if (!ok) {
+        AppendLog(L"RunPlantUmlJar: CreateProcessW failed with error " + std::to_wstring(GetLastError()));
         CloseHandle(hInW); CloseHandle(hOutR);
         return false;
     }
@@ -238,7 +336,9 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     std::string umlUtf8 = ToUtf8(umlTextW);
     DWORD written = 0;
     if (!umlUtf8.empty()) {
-        WriteFile(hInW, umlUtf8.data(), (DWORD)umlUtf8.size(), &written, nullptr);
+        if (!WriteFile(hInW, umlUtf8.data(), (DWORD)umlUtf8.size(), &written, nullptr)) {
+            AppendLog(L"RunPlantUmlJar: failed to write UML to stdin");
+        }
     }
     CloseHandle(hInW); // signal EOF
 
@@ -262,7 +362,10 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     CloseHandle(hOutR);
 
     DWORD wr = WaitForSingleObject(pi.hProcess, g_jarTimeoutMs);
-    if (wr == WAIT_TIMEOUT) {
+    if (wr == WAIT_FAILED) {
+        AppendLog(L"RunPlantUmlJar: WaitForSingleObject failed with error " + std::to_wstring(GetLastError()));
+    } else if (wr == WAIT_TIMEOUT) {
+        AppendLog(L"RunPlantUmlJar: timeout after " + std::to_wstring(g_jarTimeoutMs) + L" ms");
         TerminateProcess(pi.hProcess, 1);
     }
     CloseHandle(pi.hThread);
@@ -270,14 +373,20 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     GetExitCodeProcess(pi.hProcess, &exitCode);
     CloseHandle(pi.hProcess);
 
-    if (buffer.empty()) return false;
+    if (buffer.empty()) {
+        AppendLog(L"RunPlantUmlJar: process produced no output. exitCode=" + std::to_wstring(exitCode));
+        return false;
+    }
 
     if (preferSvg) {
         // interpret bytes as UTF-8 SVG
         int wlen = MultiByteToWideChar(CP_UTF8, 0,
                                        (const char*)buffer.data(), (int)buffer.size(),
                                        nullptr, 0);
-        if (wlen <= 0) return false;
+        if (wlen <= 0) {
+            AppendLog(L"RunPlantUmlJar: failed to decode SVG output");
+            return false;
+        }
         std::wstring svg(wlen, L'\0');
         MultiByteToWideChar(CP_UTF8, 0, (const char*)buffer.data(), (int)buffer.size(),
                             svg.data(), wlen);
@@ -285,6 +394,8 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     } else {
         outPng.swap(buffer);
     }
+    AppendLog(L"RunPlantUmlJar: success. exitCode=" + std::to_wstring(exitCode) +
+              L", outputLength=" + std::to_wstring((unsigned long long)(preferSvg ? outSvg.size() : outPng.size())));
     return true;
 }
 
@@ -503,8 +614,10 @@ static void EnsureWndClass(){
 }
 
 static void InitWebView(struct Host* host){
+    AppendLog(L"InitWebView: loading WebView2Loader.dll");
     host->hWvLoader = LoadLibraryW(L"WebView2Loader.dll");
     if(!host->hWvLoader){
+        AppendLog(L"InitWebView: WebView2Loader.dll not found");
         CreateWindowW(L"STATIC", L"WebView2 Runtime not found. Install Edge WebView2 Runtime.", WS_CHILD|WS_VISIBLE|SS_CENTER,
                       0,0,0,0, host->hwnd, nullptr, host->hInst, nullptr);
         return;
@@ -512,26 +625,43 @@ static void InitWebView(struct Host* host){
     auto fn = reinterpret_cast<PFN_CreateCoreWebView2EnvironmentWithOptions>(
         GetProcAddress(host->hWvLoader, "CreateCoreWebView2EnvironmentWithOptions"));
     if(!fn){
+        AppendLog(L"InitWebView: CreateCoreWebView2EnvironmentWithOptions entry not found");
         CreateWindowW(L"STATIC", L"WebView2 loader entry not found.", WS_CHILD|WS_VISIBLE|SS_CENTER,
                       0,0,0,0, host->hwnd, nullptr, host->hInst, nullptr);
         return;
     }
 
+    AppendLog(L"InitWebView: creating environment");
     fn(nullptr, nullptr, nullptr,
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [host](HRESULT hr, ICoreWebView2Environment* env)->HRESULT{
-                if(FAILED(hr) || !env) return S_OK;
+                if(FAILED(hr) || !env){
+                    AppendLog(L"InitWebView: environment creation failed with HRESULT=" + std::to_wstring(hr));
+                    return S_OK;
+                }
+                AppendLog(L"InitWebView: environment ready");
                 host->env = env;
                 env->CreateCoreWebView2Controller(host->hwnd,
                     Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
                         [host](HRESULT hr, ICoreWebView2Controller* ctrl)->HRESULT{
-                            if(FAILED(hr) || !ctrl) return S_OK;
+                            if(FAILED(hr) || !ctrl){
+                                AppendLog(L"InitWebView: controller creation failed with HRESULT=" + std::to_wstring(hr));
+                                return S_OK;
+                            }
+                            AppendLog(L"InitWebView: controller ready");
                             host->ctrl = ctrl;
                             host->ctrl->get_CoreWebView2(&host->web);
+                            if (!host->web) {
+                                AppendLog(L"InitWebView: failed to get CoreWebView2 interface");
+                                return S_OK;
+                            }
+                            AppendLog(L"InitWebView: CoreWebView2 obtained");
                             RECT rc; GetClientRect(host->hwnd, &rc);
                             host->ctrl->put_Bounds(rc);
-                            if (!host->initialHtml.empty())
+                            if (!host->initialHtml.empty()){
+                                AppendLog(L"InitWebView: navigating to initial HTML (" + std::to_wstring(host->initialHtml.size()) + L" chars)");
                                 host->web->NavigateToString(host->initialHtml.c_str());
+                            }
                             return S_OK;
                         }).Get());
                 return S_OK;
@@ -549,6 +679,7 @@ __declspec(dllexport) int __stdcall ListGetDetectString(char* DetectString, int 
 
 __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLoad, int /*ShowFlags*/) {
     LoadConfigIfNeeded();
+    AppendLog(L"ListLoadW: start for file " + std::wstring(FileToLoad ? FileToLoad : L"<null>"));
     EnsureWndClass();
 
     auto* host = new Host();
@@ -559,47 +690,71 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
     SetWindowLongPtrW(host->hwnd, GWLP_USERDATA, (LONG_PTR)host);
 
     const std::wstring text = ReadFileUtf16OrAnsi(FileToLoad);
+    AppendLog(L"ListLoadW: loaded file characters=" + std::to_wstring(text.size()));
     const bool preferSvg = (ToLowerTrim(g_prefer) == L"svg");
+    AppendLog(L"ListLoadW: preferSvg=" + std::wstring(preferSvg ? L"true" : L"false"));
 
     // Decide render path by order
     const std::vector<std::wstring> order = SplitOrder(g_order.empty() ? L"java,web" : g_order);
+    {
+        std::wstringstream os;
+        os << L"ListLoadW: render order=";
+        for (size_t i = 0; i < order.size(); ++i) {
+            if (i) os << L",";
+            os << order[i];
+        }
+        AppendLog(os.str());
+    }
     bool produced = false;
     std::wstring lastErr;
 
     for (const auto& step : order) {
+        AppendLog(L"ListLoadW: considering renderer step '" + step + L"'");
         if (step == L"java") {
             std::wstring svgOut;
             std::vector<unsigned char> pngOut;
+            AppendLog(L"ListLoadW: attempting local Java render with jar=" + (g_jarPath.empty() ? std::wstring(L"<auto>") : g_jarPath));
             if (RunPlantUmlJar(text, preferSvg, svgOut, pngOut)) {
                 if (preferSvg) {
                     host->initialHtml = BuildShellHtmlWithBody(svgOut);
+                    AppendLog(L"ListLoadW: local render succeeded (SVG)");
                 } else {
                     const std::string b64 = Base64(pngOut);
                     std::wstring body = L"<img alt=\"diagram\" src=\"data:image/png;base64,";
                     body += FromUtf8(b64); body += L"\"/>";
                     host->initialHtml = BuildShellHtmlWithBody(body);
+                    AppendLog(L"ListLoadW: local render succeeded (PNG)");
                 }
                 produced = true;
                 break; // Success, so we're done.
             } else {
                 lastErr = L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.";
-                host->initialHtml = BuildErrorHtml(lastErr);
-                produced = true; // We "produced" an error page.
-                break; // Failure, so we're done.
+                AppendLog(L"ListLoadW: local render failed");
+                continue; // Try next step in the order.
             }
         } else if (step == L"web") {
             host->initialHtml = BuildServerHtml(g_serverUrl, preferSvg, text);
+            AppendLog(L"ListLoadW: prepared web fallback HTML with server=" + g_serverUrl);
             produced = true;
             break; // We can only try, so we're done.
+        } else {
+            AppendLog(L"ListLoadW: ignoring unknown renderer step '" + step + L"'");
         }
         // Unrecognized steps are ignored
     }
 
     if (!produced) {
-        host->initialHtml = BuildErrorHtml(L"No valid renderer specified in `render.order` of INI file. Check plantumlwebview.ini.");
+        if (!lastErr.empty()) {
+            host->initialHtml = BuildErrorHtml(lastErr);
+            AppendLog(L"ListLoadW: showing error HTML");
+        } else {
+            host->initialHtml = BuildErrorHtml(L"No valid renderer specified in `render.order` of INI file. Check plantumlwebview.ini.");
+            AppendLog(L"ListLoadW: no renderer produced output");
+        }
     }
 
     InitWebView(host);
+    AppendLog(L"ListLoadW: InitWebView invoked");
     return host->hwnd;
 }
 
@@ -609,6 +764,7 @@ __declspec(dllexport) int __stdcall ListSendCommand(HWND /*ListWin*/, int /*Comm
 }
 
 __declspec(dllexport) void __stdcall ListCloseWindow(HWND ListWin) {
+    AppendLog(L"ListCloseWindow: destroying window");
     DestroyWindow(ListWin);
 }
 
