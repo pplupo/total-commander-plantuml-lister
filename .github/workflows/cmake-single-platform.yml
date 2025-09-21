@@ -29,6 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -56,6 +58,14 @@ jobs:
           } else {
             "updated=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           }
+
+      - name: Stage PlantUML updates
+        if: steps.plantuml_update.outputs.updated == 'true'
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add third_party
+          git add plantumlwebview.ini
 
       - name: Install tools
         run: |
@@ -165,6 +175,29 @@ jobs:
             $tag = "manual-$sha"
           }
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create PlantUML update PR
+        id: create_pr
+        if: steps.plantuml_update.outputs.updated == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: Update PlantUML to latest version
+          title: 'Update PlantUML to latest version'
+          body: |
+            This PR updates the bundled PlantUML MIT-licensed jar to the latest version.
+            It was created automatically by the Build + Release workflow while preparing `${{ steps.tag.outputs.tag }}`.
+          branch: release/plantuml-update-${{ steps.tag.outputs.tag }}
+          base: main
+          delete-branch: true
+
+      - name: Enable automerge for PlantUML update PR
+        if: steps.create_pr.outputs.pull-request-number
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ steps.create_pr.outputs.pull-request-number }}
+          merge-method: squash
 
       - name: Generate release notes
         id: release_notes
