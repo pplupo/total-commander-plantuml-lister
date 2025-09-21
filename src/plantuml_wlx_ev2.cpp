@@ -712,6 +712,7 @@ static void InitWebView(struct Host* host){
     }
 }
 
+
 // ---------------------- WLX exports ----------------------
 extern "C" {
 
