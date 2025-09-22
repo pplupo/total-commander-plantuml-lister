@@ -9,6 +9,7 @@
 #include <shlwapi.h>
 #include <commdlg.h>
 #include <wrl.h>
+#include <wrl/event.h>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -1008,31 +1009,55 @@ static void InitWebView(struct Host* host){
 
     AppendLog(L"InitWebView: creating environment");
     HostAddRef(host);
-    HRESULT hrEnv = fn(nullptr, nullptr, nullptr,
-        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [host](HRESULT hr, ICoreWebView2Environment* env)->HRESULT{
-                std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
-                if(!host || host->closing.load(std::memory_order_acquire)){
-                    AppendLog(L"InitWebView: host closing before environment callback");
-                    return S_OK;
-                }
-                if(FAILED(hr) || !env){
-                    AppendLog(L"InitWebView: environment creation failed with HRESULT=" + std::to_wstring(hr));
-                    return S_OK;
-                }
-                AppendLog(L"InitWebView: environment ready");
-                host->env = env;
-                HostAddRef(host);
-                HRESULT hrCtrl = env->CreateCoreWebView2Controller(host->hwnd,
-                    Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [host](HRESULT hr, ICoreWebView2Controller* ctrl)->HRESULT{
+    auto envCompleted = Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+        [host](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+            std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+            if(!host || host->closing.load(std::memory_order_acquire)){
+                AppendLog(L"InitWebView: host closing before environment callback");
+                return S_OK;
+            }
+            if(FAILED(hr) || !env){
+                AppendLog(L"InitWebView: environment creation failed with HRESULT=" + std::to_wstring(hr));
+                return S_OK;
+            }
+            AppendLog(L"InitWebView: environment ready");
+            host->env = env;
+
+            HostAddRef(host);
+            auto controllerCompleted = Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [host](HRESULT hrCtrl, ICoreWebView2Controller* ctrl) -> HRESULT {
+                    std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                    if(!host || host->closing.load(std::memory_order_acquire)){
+                        AppendLog(L"InitWebView: host closing before controller callback");
+                        return S_OK;
+                    }
+                    if(FAILED(hrCtrl) || !ctrl){
+                        AppendLog(L"InitWebView: controller creation failed with HRESULT=" + std::to_wstring(hrCtrl));
+                        return S_OK;
+                    }
+                    AppendLog(L"InitWebView: controller ready");
+                    host->ctrl = ctrl;
+                    host->ctrl->get_CoreWebView2(&host->web);
+                    if (!host->web) {
+                        AppendLog(L"InitWebView: failed to get CoreWebView2 interface");
+                        return S_OK;
+                    }
+                    AppendLog(L"InitWebView: CoreWebView2 obtained");
+                    if(!host->hwnd){
+                        AppendLog(L"InitWebView: window destroyed before bounds update");
+                        return S_OK;
+                    }
+                    RECT rc; GetClientRect(host->hwnd, &rc);
+                    host->ctrl->put_Bounds(rc);
+
+                    HostAddRef(host);
+                    auto webMessageHandler = Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                        [host](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
                             std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
                             if(!host || host->closing.load(std::memory_order_acquire)){
-                                AppendLog(L"InitWebView: host closing before controller callback");
                                 return S_OK;
                             }
-                            if(FAILED(hr) || !ctrl){
-                                AppendLog(L"InitWebView: controller creation failed with HRESULT=" + std::to_wstring(hr));
+                            if (!args) {
                                 return S_OK;
                             }
                             AppendLog(L"InitWebView: controller ready");
@@ -1117,22 +1142,70 @@ static void InitWebView(struct Host* host){
                                     AppendLog(L"InitWebView: add_NavigationCompleted failed with HRESULT=" + std::to_wstring(hrNav));
                                     HostRelease(host);
                                 }
+                            } else if (rawJson) {
+                                CoTaskMemFree(rawJson);
                             }
-                            {
-                                std::lock_guard<std::mutex> lock(host->stateMutex);
-                                if (!host->initialHtml.empty()){
-                                    AppendLog(L"InitWebView: navigating to initial HTML (" + std::to_wstring(host->initialHtml.size()) + L" chars)");
-                                }
-                            }
-                            HostNavigateToInitialHtml(host);
                             return S_OK;
-                        }).Get());
-                if(FAILED(hrCtrl)){
-                    AppendLog(L"InitWebView: CreateCoreWebView2Controller call failed with HRESULT=" + std::to_wstring(hrCtrl));
-                    HostRelease(host);
-                }
-                return S_OK;
-            }).Get());
+                        });
+                    EventRegistrationToken msgToken{};
+                    HRESULT hrMsg = host->web->add_WebMessageReceived(webMessageHandler.Get(), &msgToken);
+                    if (SUCCEEDED(hrMsg)) {
+                        host->webMessageToken = msgToken;
+                        host->webMessageRegistered = true;
+                    } else {
+                        AppendLog(L"InitWebView: add_WebMessageReceived failed with HRESULT=" + std::to_wstring(hrMsg));
+                        HostRelease(host);
+                    }
+
+                    HostAddRef(host);
+                    auto navCompletedHandler = Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                        [host](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                            std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                            if(!host || host->closing.load(std::memory_order_acquire)){
+                                return S_OK;
+                            }
+                            UINT64 navId = 0;
+                            if (args) args->get_NavigationId(&navId);
+                            BOOL isSuccess = FALSE;
+                            if (args) args->get_IsSuccess(&isSuccess);
+                            COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                            if (args) args->get_WebErrorStatus(&status);
+                            std::wstringstream os;
+                            os << L"InitWebView: NavigationCompleted id=" << navId
+                               << L", success=" << (isSuccess ? L"true" : L"false")
+                               << L", webErrorStatus=" << static_cast<int>(status);
+                            AppendLog(os.str());
+                            return S_OK;
+                        });
+                    EventRegistrationToken navToken{};
+                    HRESULT hrNav = host->web->add_NavigationCompleted(navCompletedHandler.Get(), &navToken);
+                    if (SUCCEEDED(hrNav)) {
+                        host->navCompletedToken = navToken;
+                        host->navCompletedRegistered = true;
+                    } else {
+                        AppendLog(L"InitWebView: add_NavigationCompleted failed with HRESULT=" + std::to_wstring(hrNav));
+                        HostRelease(host);
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(host->stateMutex);
+                        if (!host->initialHtml.empty()){
+                            AppendLog(L"InitWebView: navigating to initial HTML (" + std::to_wstring(host->initialHtml.size()) + L" chars)");
+                        }
+                    }
+                    HostNavigateToInitialHtml(host);
+                    return S_OK;
+                });
+
+            HRESULT hrCtrl = env->CreateCoreWebView2Controller(host->hwnd, controllerCompleted.Get());
+            if(FAILED(hrCtrl)){
+                AppendLog(L"InitWebView: CreateCoreWebView2Controller call failed with HRESULT=" + std::to_wstring(hrCtrl));
+                HostRelease(host);
+            }
+            return S_OK;
+        });
+
+    HRESULT hrEnv = fn(nullptr, nullptr, nullptr, envCompleted.Get());
     if(FAILED(hrEnv)){
         AppendLog(L"InitWebView: CreateCoreWebView2EnvironmentWithOptions call failed with HRESULT=" + std::to_wstring(hrEnv));
         HostRelease(host);
