@@ -1304,6 +1304,7 @@ static void InitWebView(struct Host* host){
                     HostAddRef(host);
                     auto webMessageHandler = Callback<ICoreWebView2WebMessageReceivedEventHandler>(
                         [host](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                            HostAddRef(host);
                             std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
                             if (!host || host->closing.load(std::memory_order_acquire)) {
                                 return S_OK;
@@ -1348,6 +1349,7 @@ static void InitWebView(struct Host* host){
                     HostAddRef(host);
                     auto navCompletedHandler = Callback<ICoreWebView2NavigationCompletedEventHandler>(
                         [host](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                            HostAddRef(host);
                             std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
                             if(!host || host->closing.load(std::memory_order_acquire)){
                                 return S_OK;
