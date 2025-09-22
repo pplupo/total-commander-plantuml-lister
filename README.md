@@ -75,6 +75,8 @@ string=EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUM
 
 [debug]
 ; Optional log file path (defaults next to the plugin DLL)
+; Set log_enabled=0 to disable logging entirely
+log_enabled=1
 log=
 ```
 
@@ -96,7 +98,7 @@ All rendering happens locally via Java and `plantuml.jar`; the plugin does not p
 * **Blank panel / “Render error”**
 
   * Verify Java and `plantuml.jar` paths in `[plantuml]` are correct.
-  * Enable logging via `[debug] log=` and inspect `plantumlwebview.log` for details.
+* **Logging** – keep `[debug] log_enabled=1` (default) and inspect `plantumlwebview.log` (or a custom `[debug] log=` path) for details.
 * **“WebView2 Runtime not found”**
 
   * Install the **WebView2 Runtime (Evergreen)** from Microsoft (link above) and retry.
