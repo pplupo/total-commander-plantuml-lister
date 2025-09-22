@@ -440,6 +440,8 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     return true;
 }
 
+static std::wstring BuildShellHtmlWithBody(const std::wstring& body);
+
 static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
                                     bool preferSvg,
                                     std::wstring& outHtml) {
@@ -888,15 +890,10 @@ static void InitWebView(struct Host* host){
                                         if (args) args->get_IsSuccess(&isSuccess);
                                         COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
                                         if (args) args->get_WebErrorStatus(&status);
-                                        HRESULT extended = S_OK;
-                                        if (args) args->get_ExtendedError(&extended);
-                                        wchar_t extBuf[32];
-                                        swprintf(extBuf, 32, L"0x%08X", extended);
                                         std::wstringstream os;
                                         os << L"InitWebView: NavigationCompleted id=" << navId
                                            << L", success=" << (isSuccess ? L"true" : L"false")
-                                           << L", webErrorStatus=" << static_cast<int>(status)
-                                           << L", extendedError=" << extBuf;
+                                           << L", webErrorStatus=" << static_cast<int>(status);
                                         AppendLog(os.str());
                                         return S_OK;
                                     }).Get(), &navToken);
