@@ -925,6 +925,31 @@ static void InitWebView(struct Host* host){
                                                 HostTriggerFallback(host, detail);
                                             } else if (tag == L"web-fetch") {
                                                 AppendLog(L"InitWebView: Web fetch detail -> " + detail);
+                                                if (!detail.empty()) {
+                                                    bool isFailure = (detail.rfind(L"failure", 0) == 0);
+                                                    if (!isFailure) {
+                                                        const std::wstring lowerDetail = ToLowerTrim(detail);
+                                                        isFailure = (lowerDetail.rfind(L"failure", 0) == 0);
+                                                    }
+                                                    if (isFailure) {
+                                                        std::wstring reason = detail;
+                                                        const std::wstring marker = L"message=";
+                                                        size_t pos = reason.find(marker);
+                                                        if (pos != std::wstring::npos) {
+                                                            reason = reason.substr(pos + marker.size());
+                                                            while (!reason.empty() && iswspace(reason.front())) {
+                                                                reason.erase(reason.begin());
+                                                            }
+                                                            while (!reason.empty() && iswspace(reason.back())) {
+                                                                reason.pop_back();
+                                                            }
+                                                            if (reason.empty()) {
+                                                                reason = L"web renderer error";
+                                                            }
+                                                        }
+                                                        HostTriggerFallback(host, reason);
+                                                    }
+                                                }
                                             } else if (!message.empty()) {
                                                 AppendLog(L"InitWebView: Web message -> " + message);
                                             }
