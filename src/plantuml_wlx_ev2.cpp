@@ -105,6 +105,31 @@ static void ReplaceAll(std::wstring& inout, const std::wstring& from, const std:
     }
 }
 
+static std::wstring ExtractJsonStringField(const std::wstring& json, const std::wstring& field) {
+    if (json.empty() || field.empty()) {
+        return std::wstring();
+    }
+    const std::wstring needle = L"\"" + field + L"\"";
+    size_t pos = json.find(needle);
+    if (pos == std::wstring::npos) {
+        return std::wstring();
+    }
+    pos = json.find(L':', pos + needle.size());
+    if (pos == std::wstring::npos) {
+        return std::wstring();
+    }
+    size_t quote = json.find_first_of(L"\"'", pos + 1);
+    if (quote == std::wstring::npos) {
+        return std::wstring();
+    }
+    const wchar_t delimiter = json[quote];
+    size_t end = json.find(delimiter, quote + 1);
+    if (end == std::wstring::npos) {
+        return std::wstring();
+    }
+    return json.substr(quote + 1, end - quote - 1);
+}
+
 static std::wstring FromUtf8(const std::string& s) {
     if (s.empty()) return std::wstring();
     int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -450,7 +475,7 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     return true;
 }
 
-static std::wstring BuildShellHtmlWithBody(const std::wstring& body);
+static std::wstring BuildShellHtmlWithBody(const std::wstring& body, bool preferSvg);
 
 static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
                                     bool preferSvg,
@@ -464,13 +489,19 @@ static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
     }
 
     if (preferSvg) {
-        outHtml = BuildShellHtmlWithBody(svgOut);
+        outHtml = BuildShellHtmlWithBody(svgOut, true);
     } else {
         const std::string b64 = Base64(pngOut);
         std::wstring body = L"<img alt=\"diagram\" src=\"data:image/png;base64,";
         body += FromUtf8(b64);
         body += L"\"/>";
-        outHtml = BuildShellHtmlWithBody(body);
+        outHtml = BuildShellHtmlWithBody(body, false);
+    }
+    if (outSvg) {
+        *outSvg = std::move(svgOut);
+    }
+    if (outPng) {
+        *outPng = std::move(pngOut);
     }
     if (outSvg) {
         *outSvg = std::move(svgOut);
@@ -482,7 +513,7 @@ static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
 }
 
 // Build minimal HTML wrapper with injected BODY (svg markup or <img src="data:...">)
-static std::wstring BuildShellHtmlWithBody(const std::wstring& body) {
+static std::wstring BuildShellHtmlWithBody(const std::wstring& body, bool preferSvg) {
     std::wstring html = LR"HTML(<!doctype html>
 <html>
 <head>
@@ -495,39 +526,138 @@ static std::wstring BuildShellHtmlWithBody(const std::wstring& body) {
     html, body { height: 100%; }
     body { margin: 0; background: canvas; color: CanvasText; font: 13px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; position: relative; }
     #toolbar { position: fixed; top: 8px; left: 8px; display: flex; gap: 6px; z-index: 10; }
-    #toolbar button { padding: 6px 10px; border-radius: 6px; border: 1px solid color-mix(in oklab, Canvas 70%, CanvasText 30%); background: color-mix(in oklab, Canvas 92%, CanvasText 8%); color: inherit; font: inherit; cursor: pointer; }
-    #toolbar button:hover { background: color-mix(in oklab, Canvas 88%, CanvasText 12%); }
-    #toolbar button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #toolbar button, #toolbar select { padding: 6px 10px; border-radius: 6px; border: 1px solid color-mix(in oklab, Canvas 70%, CanvasText 30%); background: color-mix(in oklab, Canvas 92%, CanvasText 8%); color: inherit; font: inherit; cursor: pointer; }
+    #toolbar button:hover, #toolbar select:hover { background: color-mix(in oklab, Canvas 88%, CanvasText 12%); }
+    #toolbar button:disabled, #toolbar select:disabled { opacity: 0.6; cursor: not-allowed; }
     #root { padding: 56px 8px 8px 8px; display: grid; place-items: start center; }
     img, svg { max-width: 100%; height: auto; }
     .err { padding: 12px 14px; border-radius: 10px; background: color-mix(in oklab, Canvas 85%, red 15%); }
   </style>
 </head>
-<body>
+<body data-format="{{FORMAT}}">
   <div id="toolbar">
-    <button id="btn-save" type="button">Save as…</button>
+    <button id="btn-refresh" type="button">Refresh</button>
+    <button id="btn-save" type="button">Save as...</button>
+    <select id="format-select">
+      <option value="svg">SVG</option>
+      <option value="png">PNG</option>
+    </select>
+    <button id="btn-copy" type="button">Copy to clipboard</button>
   </div>
   <div id="root">
     {{BODY}}
   </div>
   <script>
-    const saveBtn = document.getElementById('btn-save');
-    if (saveBtn) {
-      const updateButtonState = () => {
+    const hookButton = (btn, messageType) => {
+      if (!btn) {
+        return;
+      }
+      const update = () => {
         const connected = !!(window.chrome && window.chrome.webview);
-        saveBtn.disabled = !connected;
+        btn.disabled = !connected;
         if (!connected) {
-          saveBtn.title = 'Available inside Total Commander';
-          window.setTimeout(updateButtonState, 1000);
+          btn.title = 'Available inside Total Commander';
+          window.setTimeout(update, 1000);
         } else {
-          saveBtn.removeAttribute('title');
+          btn.removeAttribute('title');
         }
       };
-      updateButtonState();
-      saveBtn.addEventListener('click', () => {
+      update();
+      btn.addEventListener('click', () => {
         if (window.chrome && window.chrome.webview) {
-          window.chrome.webview.postMessage({ type: 'saveAs' });
+          window.chrome.webview.postMessage({ type: messageType });
         }
+      });
+    };
+    hookButton(document.getElementById('btn-refresh'), 'refresh');
+    hookButton(document.getElementById('btn-save'), 'saveAs');
+    const select = document.getElementById('format-select');
+    if (select) {
+      const setDisabled = (disabled) => {
+        if (disabled) {
+          select.setAttribute('disabled', 'disabled');
+        } else {
+          select.removeAttribute('disabled');
+        }
+      };
+      const update = () => {
+        const connected = !!(window.chrome && window.chrome.webview);
+        setDisabled(!connected);
+        if (!connected) {
+          select.title = 'Available inside Total Commander';
+          window.setTimeout(update, 1000);
+        } else {
+          select.removeAttribute('title');
+        }
+      };
+      const initial = document.body?.dataset?.format;
+      if (initial) {
+        select.value = initial;
+      }
+      select.addEventListener('change', () => {
+        if (document.body && document.body.dataset) {
+          document.body.dataset.format = select.value;
+        }
+        if (typeof updateCopyState === 'function') {
+          updateCopyState();
+        }
+        if (window.chrome && window.chrome.webview) {
+          window.chrome.webview.postMessage({ type: 'setFormat', format: select.value });
+        }
+      });
+      update();
+    }
+    const copyButton = document.getElementById('btn-copy');
+    const copyDiagram = async () => {
+      if (!navigator.clipboard) {
+        return false;
+      }
+      const svg = document.querySelector('svg');
+      if (svg) {
+        const s = new XMLSerializer().serializeToString(svg);
+        await navigator.clipboard.writeText(s);
+        return true;
+      }
+      const img = document.querySelector('img');
+      if (img) {
+        if (!window.ClipboardItem) {
+          return false;
+        }
+        const c = document.createElement('canvas');
+        c.width = img.naturalWidth;
+        c.height = img.naturalHeight;
+        const g = c.getContext('2d');
+        g.drawImage(img, 0, 0);
+        const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        return true;
+      }
+      return false;
+    };
+    let updateCopyState = null;
+    if (copyButton) {
+      updateCopyState = () => {
+        const connected = !!(window.chrome && window.chrome.webview);
+        const format = document.body?.dataset?.format || 'svg';
+        const clipboardItemAvailable = typeof window.ClipboardItem !== 'undefined';
+        const canCopy = !!navigator.clipboard && (format !== 'png' || clipboardItemAvailable);
+        copyButton.disabled = !(connected && canCopy);
+        if (!connected) {
+          copyButton.title = 'Available inside Total Commander';
+          window.setTimeout(updateCopyState, 1000);
+        } else if (!canCopy) {
+          copyButton.title = format === 'png' && !clipboardItemAvailable
+            ? 'Clipboard image support is unavailable'
+            : 'Clipboard access is unavailable';
+        } else {
+          copyButton.removeAttribute('title');
+        }
+      };
+      updateCopyState();
+      copyButton.addEventListener('click', async () => {
+        try {
+          await copyDiagram();
+        } catch (e) {}
       });
     }
     // Ctrl+C copies SVG or PNG
@@ -535,21 +665,7 @@ static std::wstring BuildShellHtmlWithBody(const std::wstring& body) {
       if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'c') {
         ev.preventDefault();
         try {
-          const svg = document.querySelector('svg');
-          if (svg) {
-            const s = new XMLSerializer().serializeToString(svg);
-            await navigator.clipboard.writeText(s);
-            return;
-          }
-          const img = document.querySelector('img');
-          if (img) {
-            const c = document.createElement('canvas');
-            c.width = img.naturalWidth; c.height = img.naturalHeight;
-            const g = c.getContext('2d');
-            g.drawImage(img, 0, 0);
-            const blob = await new Promise(r => c.toBlob(r, 'image/png'));
-            await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-          }
+          await copyDiagram();
         } catch (e) {}
       }
     });
@@ -557,14 +673,15 @@ static std::wstring BuildShellHtmlWithBody(const std::wstring& body) {
 </body>
 </html>)HTML";
     ReplaceAll(html, L"{{BODY}}", body);
+    ReplaceAll(html, L"{{FORMAT}}", preferSvg ? L"svg" : L"png");
     return html;
 }
 
-static std::wstring BuildErrorHtml(const std::wstring& message) {
+static std::wstring BuildErrorHtml(const std::wstring& message, bool preferSvg) {
     std::wstring safe = message;
     ReplaceAll(safe, L"<", L"&lt;");
     ReplaceAll(safe, L">", L"&gt;");
-    return BuildShellHtmlWithBody(L"<div class='err'>"+safe+L"</div>");
+    return BuildShellHtmlWithBody(L"<div class='err'>"+safe+L"</div>", preferSvg);
 }
 
 // ---------------------- WebView host ----------------------
@@ -618,6 +735,82 @@ static void HostRelease(Host* host) {
     if (host->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         delete host;
     }
+}
+
+static bool HostRenderAndReload(Host* host,
+                                bool preferSvg,
+                                const std::wstring& logContext,
+                                const std::wstring& failureDialogMessage,
+                                bool showDialogOnFailure) {
+    if (!host) {
+        return false;
+    }
+
+    std::wstring sourcePath;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        sourcePath = host->sourceFilePath;
+    }
+
+    if (sourcePath.empty()) {
+        AppendLog(logContext + L": no source path recorded");
+        {
+            std::lock_guard<std::mutex> lock(host->stateMutex);
+            host->lastPreferSvg = preferSvg;
+        }
+        if (showDialogOnFailure && host->hwnd) {
+            MessageBoxW(host->hwnd,
+                        L"Unable to render because the original file path is unknown.",
+                        L"PlantUML Viewer",
+                        MB_OK | MB_ICONERROR);
+        }
+        return false;
+    }
+
+    AppendLog(logContext + L": reloading file " + sourcePath);
+    const std::wstring text = ReadFileUtf16OrAnsi(sourcePath.c_str());
+    AppendLog(logContext + L": file characters=" + std::to_wstring(text.size()));
+
+    std::wstring html;
+    std::wstring svg;
+    std::vector<unsigned char> png;
+    std::wstring htmlToNavigate;
+
+    if (BuildHtmlFromJavaRender(text, preferSvg, html, &svg, &png)) {
+        AppendLog(logContext + L": render succeeded");
+        {
+            std::lock_guard<std::mutex> lock(host->stateMutex);
+            host->initialHtml = html;
+            host->lastSvg = std::move(svg);
+            host->lastPng = std::move(png);
+            host->lastPreferSvg = preferSvg;
+            host->hasRender = true;
+            htmlToNavigate = host->initialHtml;
+        }
+    } else {
+        AppendLog(logContext + L": render failed");
+        const std::wstring dialogMessage = failureDialogMessage.empty()
+            ? std::wstring(L"Unable to render the diagram. Check the log for details.")
+            : failureDialogMessage;
+        {
+            std::lock_guard<std::mutex> lock(host->stateMutex);
+            host->initialHtml = BuildErrorHtml(dialogMessage, preferSvg);
+            host->lastSvg.clear();
+            host->lastPng.clear();
+            host->lastPreferSvg = preferSvg;
+            host->hasRender = false;
+            htmlToNavigate = host->initialHtml;
+        }
+        if (showDialogOnFailure && host->hwnd) {
+            MessageBoxW(host->hwnd, dialogMessage.c_str(), L"PlantUML Viewer", MB_OK | MB_ICONERROR);
+        }
+    }
+
+    if (host->web && !htmlToNavigate.empty()) {
+        host->web->NavigateToString(htmlToNavigate.c_str());
+    }
+
+    return true;
 }
 
 static void HostHandleSaveAs(Host* host) {
@@ -705,6 +898,38 @@ static void HostHandleSaveAs(Host* host) {
     }
 
     AppendLog(L"HostHandleSaveAs: saved diagram to " + savePath);
+}
+
+static void HostHandleRefresh(Host* host) {
+    if (!host) return;
+
+    bool preferSvg = true;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        preferSvg = host->lastPreferSvg;
+    }
+
+    HostRenderAndReload(host,
+                        preferSvg,
+                        L"HostHandleRefresh",
+                        L"Unable to refresh the diagram. Check the log for details.",
+                        true);
+}
+
+static void HostHandleFormatChange(Host* host, bool preferSvg) {
+    if (!host) return;
+
+    const std::wstring formatLabel = preferSvg ? L"svg" : L"png";
+    const std::wstring logContext = std::wstring(L"HostHandleFormatChange(") + formatLabel + L")";
+    const std::wstring errorMessage = preferSvg
+        ? std::wstring(L"Unable to render the diagram as SVG. Check the log for details.")
+        : std::wstring(L"Unable to render the diagram as PNG. Check the log for details.");
+
+    HostRenderAndReload(host,
+                        preferSvg,
+                        logContext,
+                        errorMessage,
+                        true);
 }
 
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
@@ -842,23 +1067,15 @@ static void InitWebView(struct Host* host){
                                             if (SUCCEEDED(hrJson) && rawJson) {
                                                 std::wstring json(rawJson);
                                                 CoTaskMemFree(rawJson);
-                                                size_t typePos = json.find(L"\"type\"");
-                                                if (typePos != std::wstring::npos) {
-                                                    size_t colon = json.find(L':', typePos);
-                                                    if (colon != std::wstring::npos) {
-                                                        size_t quote1 = json.find_first_of(L"\"'", colon + 1);
-                                                        if (quote1 != std::wstring::npos) {
-                                                            wchar_t q = json[quote1];
-                                                            size_t quote2 = json.find(q, quote1 + 1);
-                                                            if (quote2 != std::wstring::npos) {
-                                                                std::wstring value = json.substr(quote1 + 1, quote2 - quote1 - 1);
-                                                                if (value == L"saveAs") {
-                                                                    HostHandleSaveAs(host);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                                const std::wstring type = ToLowerTrim(ExtractJsonStringField(json, L"type"));
+                                                if (type == L"saveas") {
+                                                    HostHandleSaveAs(host);
+                                                } else if (type == L"refresh") {
+                                                    HostHandleRefresh(host);
+                                                } else if (type == L"setformat") {
+                                                    std::wstring format = ToLowerTrim(ExtractJsonStringField(json, L"format"));
+                                                    const bool preferSvg = format != L"png";
+                                                    HostHandleFormatChange(host, preferSvg);
                                             } else if (rawJson) {
                                                 CoTaskMemFree(rawJson);
                                             }
@@ -969,7 +1186,7 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
         const std::wstring lastErr = L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.";
         {
             std::lock_guard<std::mutex> lock(host->stateMutex);
-            host->initialHtml = BuildErrorHtml(lastErr);
+            host->initialHtml = BuildErrorHtml(lastErr, preferSvg);
             host->sourceFilePath = FileToLoad ? std::wstring(FileToLoad) : std::wstring();
             host->lastPreferSvg = preferSvg;
             host->lastSvg.clear();
