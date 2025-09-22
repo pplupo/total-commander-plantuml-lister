@@ -1,7 +1,7 @@
 # PlantUmlWebView — Total Commander Lister
 
-A tiny, modern PlantUML viewer for **Total Commander (64-bit)**.  
-Renders diagrams either **locally via Java + `plantuml.jar`** (offline) or **via a PlantUML HTTP server** (POST).  
+A tiny, modern PlantUML viewer for **Total Commander (64-bit)**.
+Renders diagrams **locally via Java + `plantuml.jar`**.
 Powered by **WebView2** — no Qt or zlib required.
 
 ---
@@ -9,8 +9,8 @@ Powered by **WebView2** — no Qt or zlib required.
 ## Why this plugin?
 
 * 🪶 **Small footprint** – just a WLX DLL, a config INI, and `WebView2Loader.dll`.
-* ⚡ **Fast preview** – render via local Java or a remote PlantUML server.
-* 🔧 **Configurable** – set your server, choose **SVG** or **PNG**, and pick render **order** (`java,web` / `web,java` / `java` / `web`).
+* ⚡ **Fast preview** – render via local Java + `plantuml.jar`.
+* 🔧 **Configurable** – choose **SVG** or **PNG**, and configure Java/JAR paths.
 * 📋 **Copy to clipboard** – **Ctrl+C** copies **SVG text** or a **PNG bitmap** from Lister.
 
 ---
@@ -18,10 +18,9 @@ Powered by **WebView2** — no Qt or zlib required.
 ## Requirements
 
 * **Total Commander 64-bit** (Lister/WLX plugin support).
-* **Microsoft Edge WebView2 Runtime** (evergreen).  
+* **Microsoft Edge WebView2 Runtime** (evergreen).
   👉 Download from Microsoft: <https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download>
-* For **server rendering**: a reachable **PlantUML HTTP server** (defaults to the public service).
-* For **local rendering**: **Java** (`javaw.exe`/`java.exe`) and **`plantuml.jar`** (shipped with releases).
+* **Java** (`javaw.exe`/`java.exe`) and **`plantuml.jar`** (shipped with releases).
 
 ---
 
@@ -38,11 +37,7 @@ That’s it. The plugin will be installed to your TC plugins folder.
 ## Usage
 
 * Select a PlantUML file (`.puml`, `.plantuml`, `.uml`, `.wsd`, `.ws`, `.iuml`) and press **F3** (Lister).
-* The plugin chooses the render path according to `render.order` in the INI:
-  * **`java,web` (default):** try local Java + `plantuml.jar`; if it fails, POST to the server.
-  * **`web,java`:** try server first, then local Java if needed.
-  * **`java`:** only local Java; shows an error if Java/JAR not available.
-  * **`web`:** only server POST.
+* The plugin renders diagrams locally via Java + `plantuml.jar`. Configure `[plantuml]` in the INI if you need explicit paths.
 * **Ctrl+C** inside the preview:
   * **SVG mode:** copies the SVG markup as text.
   * **PNG mode:** copies a PNG bitmap.
@@ -57,39 +52,32 @@ That’s it. The plugin will be installed to your TC plugins folder.
 Default contents:
 
 ```ini
-[server]
-; PlantUML server base URL (no trailing slash required).
-; Official public service (rate-limited):
-;   https://www.plantuml.com/plantuml
-; Your own server examples:
-;   http://localhost:8080/plantuml
-;   http://intranet.example/plantuml
-url=https://www.plantuml.com/plantuml
+; Rendering is performed locally via Java + plantuml.jar.
 
 [render]
 ; "svg" (default) or "png"
 prefer=svg
 
-; Render order (comma-separated, case-insensitive):
-;   java,web  -> try local JAR first; fall back to server
-;   web,java  -> try server first; fall back to local JAR
-;   java      -> only local JAR (error if Java/JAR missing)
-;   web       -> only server
-order=java,web
-
 [plantuml]
 ; If empty, the plugin auto-tries "plantuml.jar" next to PlantUmlWebView.wlx64.
-jar=
-; Optional explicit path to javaw.exe or java.exe; if empty, PATH is searched.
+; You can also point to a custom jar path here.
+jar=plantuml-mit-1.2025.7.jar
+
+; Optional explicit path to javaw.exe or java.exe. If empty, PATH is searched.
 java=
+
 ; Kill the java process if it hangs (milliseconds)
 timeout_ms=8000
 
 [detect]
 ; Detect string reported to Total Commander during installation.
-string=EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUML"```
+string=EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUML"
 
-````
+[debug]
+; Optional log file path (defaults next to the plugin DLL)
+log=
+```
+
 ### SVG vs PNG
 
 * **SVG (default):** crisp, scalable, selectable text, small output.
@@ -97,22 +85,9 @@ string=EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUM
 
 ---
 
-## Why HTTP POST (server mode)?
+## Data handling
 
-Classic PlantUML URLs compress and encode your UML text into the path (GET), which needs client-side deflate/zlib and hits URL length limits.
-This plugin uses **plain-text POST** to `/svg` or `/png`:
-
-* ✅ Keeps the plugin tiny (no compression code).
-* ✅ Avoids URL length/encoding issues.
-* ✅ Supported by the official and most self-hosted servers.
-
----
-
-## Privacy & Security
-
-* When using **server mode**, your diagram text is sent to the configured **PlantUML server**.
-* Use an **internal** server for sensitive diagrams.
-* Prefer **HTTPS** for remote servers.
+All rendering happens locally via Java and `plantuml.jar`; the plugin does not perform any network requests.
 
 ---
 
@@ -120,8 +95,8 @@ This plugin uses **plain-text POST** to `/svg` or `/png`:
 
 * **Blank panel / “Render error”**
 
-  * Check server reachability and proxy settings.
-  * Self-signed HTTPS may be blocked by WebView.
+  * Verify Java and `plantuml.jar` paths in `[plantuml]` are correct.
+  * Enable logging via `[debug] log=` and inspect `plantumlwebview.log` for details.
 * **“WebView2 Runtime not found”**
 
   * Install the **WebView2 Runtime (Evergreen)** from Microsoft (link above) and retry.

@@ -4,5 +4,5 @@ defaultdir=PlantUmlWebView
 type=wlx64
 file=PlantUmlWebView.wlx64
 name=PlantUML WebView Lister
-description=PlantUML preview via WebView2 (POST), with Java/server fallback
+description=PlantUML preview via WebView2 using local Java rendering
 defaultextension=puml plantuml uml wsd ws iuml
