@@ -34,6 +34,7 @@ static std::wstring g_jarPath;                      // If empty: auto-detect mod
 static std::wstring g_javaPath;                     // Optional explicit java[w].exe
 static std::wstring g_logPath;                      // If empty: moduleDir\plantumlwebview.log
 static DWORD        g_jarTimeoutMs = 8000;
+static bool         g_logEnabled = true;
 
 static bool         g_cfgLoaded = false;
 
@@ -52,7 +53,7 @@ static std::wstring FormatTimestamp() {
 }
 
 static void AppendLog(const std::wstring& message) {
-    if (g_logPath.empty()) return;
+    if (!g_logEnabled || g_logPath.empty()) return;
     std::lock_guard<std::mutex> lock(g_logMutex);
     HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -227,9 +228,6 @@ static void LoadConfigIfNeeded() {
 
     const std::wstring moduleDir = GetModuleDir();
     const std::wstring ini = moduleDir + L"\\plantumlwebview.ini";
-    if (g_logPath.empty()) {
-        g_logPath = moduleDir + L"\\plantumlwebview.log";
-    }
     wchar_t buf[2048];
 
     if (GetPrivateProfileStringW(L"render", L"prefer", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_prefer = buf;
@@ -256,11 +254,22 @@ static void LoadConfigIfNeeded() {
     DWORD tmo = GetPrivateProfileIntW(L"plantuml", L"timeout_ms", 0, ini.c_str());
     if (tmo > 0) g_jarTimeoutMs = tmo;
 
+    int logEnabled = GetPrivateProfileIntW(L"debug", L"log_enabled", 1, ini.c_str());
+    g_logEnabled = (logEnabled != 0);
+
     if (GetPrivateProfileStringW(L"debug", L"log", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
         g_logPath = buf;
         if (PathIsRelativeW(g_logPath.c_str())) {
             g_logPath = moduleDir + L"\\" + g_logPath;
         }
+    }
+
+    if (g_logEnabled) {
+        if (g_logPath.empty()) {
+            g_logPath = moduleDir + L"\\plantumlwebview.log";
+        }
+    } else {
+        g_logPath.clear();
     }
 
     bool needDetectJar = g_jarPath.empty();
@@ -280,7 +289,8 @@ static void LoadConfigIfNeeded() {
         << L", jar=" << (g_jarPath.empty() ? L"<auto>" : g_jarPath)
         << L", java=" << (g_javaPath.empty() ? L"<auto>" : g_javaPath)
         << L", timeoutMs=" << g_jarTimeoutMs
-        << L", log=" << g_logPath;
+        << L", logEnabled=" << (g_logEnabled ? L"1" : L"0")
+        << L", log=" << (g_logPath.empty() ? L"<disabled>" : g_logPath);
     AppendLog(cfg.str());
 }
 
@@ -487,6 +497,12 @@ static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
         body += FromUtf8(b64);
         body += L"\"/>";
         outHtml = BuildShellHtmlWithBody(body, false);
+    }
+    if (outSvg) {
+        *outSvg = std::move(svgOut);
+    }
+    if (outPng) {
+        *outPng = std::move(pngOut);
     }
     if (outSvg) {
         *outSvg = std::move(svgOut);
@@ -1044,20 +1060,87 @@ static void InitWebView(struct Host* host){
                             if (!args) {
                                 return S_OK;
                             }
-                            LPWSTR rawJson = nullptr;
-                            HRESULT hrJson = args->get_WebMessageAsJson(&rawJson);
-                            if (SUCCEEDED(hrJson) && rawJson) {
-                                std::wstring json(rawJson);
-                                CoTaskMemFree(rawJson);
-                                const std::wstring type = ToLowerTrim(ExtractJsonStringField(json, L"type"));
-                                if (type == L"saveas") {
-                                    HostHandleSaveAs(host);
-                                } else if (type == L"refresh") {
-                                    HostHandleRefresh(host);
-                                } else if (type == L"setformat") {
-                                    std::wstring format = ToLowerTrim(ExtractJsonStringField(json, L"format"));
-                                    const bool preferSvg = format != L"png";
-                                    HostHandleFormatChange(host, preferSvg);
+                            AppendLog(L"InitWebView: controller ready");
+                            host->ctrl = ctrl;
+                            host->ctrl->get_CoreWebView2(&host->web);
+                            if (!host->web) {
+                                AppendLog(L"InitWebView: failed to get CoreWebView2 interface");
+                                return S_OK;
+                            }
+                            AppendLog(L"InitWebView: CoreWebView2 obtained");
+                            if(!host->hwnd){
+                                AppendLog(L"InitWebView: window destroyed before bounds update");
+                                return S_OK;
+                            }
+                            RECT rc; GetClientRect(host->hwnd, &rc);
+                            host->ctrl->put_Bounds(rc);
+                            if (host->web) {
+                                {
+                                    HostAddRef(host);
+                                    EventRegistrationToken msgToken{};
+                                    HRESULT hrMsg = host->web->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                        [host](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args)->HRESULT{
+                                            std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                                            if(!host || host->closing.load(std::memory_order_acquire)){
+                                                return S_OK;
+                                            }
+                                            if (!args) {
+                                                return S_OK;
+                                            }
+                                            LPWSTR rawJson = nullptr;
+                                            HRESULT hrJson = args->get_WebMessageAsJson(&rawJson);
+                                            if (SUCCEEDED(hrJson) && rawJson) {
+                                                std::wstring json(rawJson);
+                                                CoTaskMemFree(rawJson);
+                                                const std::wstring type = ToLowerTrim(ExtractJsonStringField(json, L"type"));
+                                                if (type == L"saveas") {
+                                                    HostHandleSaveAs(host);
+                                                } else if (type == L"refresh") {
+                                                    HostHandleRefresh(host);
+                                                } else if (type == L"setformat") {
+                                                    std::wstring format = ToLowerTrim(ExtractJsonStringField(json, L"format"));
+                                                    const bool preferSvg = format != L"png";
+                                                    HostHandleFormatChange(host, preferSvg);
+                                            } else if (rawJson) {
+                                                CoTaskMemFree(rawJson);
+                                            }
+                                            return S_OK;
+                                        }).Get(), &msgToken);
+                                    if (SUCCEEDED(hrMsg)) {
+                                        host->webMessageToken = msgToken;
+                                        host->webMessageRegistered = true;
+                                    } else {
+                                        AppendLog(L"InitWebView: add_WebMessageReceived failed with HRESULT=" + std::to_wstring(hrMsg));
+                                        HostRelease(host);
+                                    }
+                                }
+                                HostAddRef(host);
+                                EventRegistrationToken navToken{};
+                                HRESULT hrNav = host->web->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                                    [host](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args)->HRESULT{
+                                        std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                                        if(!host || host->closing.load(std::memory_order_acquire)){
+                                            return S_OK;
+                                        }
+                                        UINT64 navId = 0;
+                                        if (args) args->get_NavigationId(&navId);
+                                        BOOL isSuccess = FALSE;
+                                        if (args) args->get_IsSuccess(&isSuccess);
+                                        COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                                        if (args) args->get_WebErrorStatus(&status);
+                                        std::wstringstream os;
+                                        os << L"InitWebView: NavigationCompleted id=" << navId
+                                           << L", success=" << (isSuccess ? L"true" : L"false")
+                                           << L", webErrorStatus=" << static_cast<int>(status);
+                                        AppendLog(os.str());
+                                        return S_OK;
+                                    }).Get(), &navToken);
+                                if (SUCCEEDED(hrNav)) {
+                                    host->navCompletedToken = navToken;
+                                    host->navCompletedRegistered = true;
+                                } else {
+                                    AppendLog(L"InitWebView: add_NavigationCompleted failed with HRESULT=" + std::to_wstring(hrNav));
+                                    HostRelease(host);
                                 }
                             } else if (rawJson) {
                                 CoTaskMemFree(rawJson);
