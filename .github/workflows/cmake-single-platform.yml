@@ -137,6 +137,12 @@ jobs:
           if (!(Test-Path $wv2)) { throw "WebView2Loader.dll not found at $wv2" }
           Copy-Item -Force $wv2 $stage\
 
+          $plantumlJar = Get-ChildItem -Path third_party -Filter 'plantuml-mit-*.jar' | Sort-Object Name -Descending | Select-Object -First 1
+          if ($null -eq $plantumlJar) {
+            throw "PlantUML jar (plantuml-mit-*.jar) not found in third_party"
+          }
+          Copy-Item -Force $plantumlJar.FullName $stage\
+
       - name: Create ZIP (no nesting)
         run: |
           Set-StrictMode -Version Latest
