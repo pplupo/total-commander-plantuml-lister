@@ -33,6 +33,7 @@ static std::wstring g_jarPath;                      // If empty: auto-detect mod
 static std::wstring g_javaPath;                     // Optional explicit java[w].exe
 static std::wstring g_logPath;                      // If empty: moduleDir\plantumlwebview.log
 static DWORD        g_jarTimeoutMs = 8000;
+static bool         g_logEnabled = true;
 
 static bool         g_cfgLoaded = false;
 
@@ -51,7 +52,7 @@ static std::wstring FormatTimestamp() {
 }
 
 static void AppendLog(const std::wstring& message) {
-    if (g_logPath.empty()) return;
+    if (!g_logEnabled || g_logPath.empty()) return;
     std::lock_guard<std::mutex> lock(g_logMutex);
     HANDLE h = CreateFileW(g_logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -226,9 +227,6 @@ static void LoadConfigIfNeeded() {
 
     const std::wstring moduleDir = GetModuleDir();
     const std::wstring ini = moduleDir + L"\\plantumlwebview.ini";
-    if (g_logPath.empty()) {
-        g_logPath = moduleDir + L"\\plantumlwebview.log";
-    }
     wchar_t buf[2048];
 
     if (GetPrivateProfileStringW(L"render", L"prefer", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_prefer = buf;
@@ -255,11 +253,22 @@ static void LoadConfigIfNeeded() {
     DWORD tmo = GetPrivateProfileIntW(L"plantuml", L"timeout_ms", 0, ini.c_str());
     if (tmo > 0) g_jarTimeoutMs = tmo;
 
+    int logEnabled = GetPrivateProfileIntW(L"debug", L"log_enabled", 1, ini.c_str());
+    g_logEnabled = (logEnabled != 0);
+
     if (GetPrivateProfileStringW(L"debug", L"log", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
         g_logPath = buf;
         if (PathIsRelativeW(g_logPath.c_str())) {
             g_logPath = moduleDir + L"\\" + g_logPath;
         }
+    }
+
+    if (g_logEnabled) {
+        if (g_logPath.empty()) {
+            g_logPath = moduleDir + L"\\plantumlwebview.log";
+        }
+    } else {
+        g_logPath.clear();
     }
 
     bool needDetectJar = g_jarPath.empty();
@@ -279,7 +288,8 @@ static void LoadConfigIfNeeded() {
         << L", jar=" << (g_jarPath.empty() ? L"<auto>" : g_jarPath)
         << L", java=" << (g_javaPath.empty() ? L"<auto>" : g_javaPath)
         << L", timeoutMs=" << g_jarTimeoutMs
-        << L", log=" << g_logPath;
+        << L", logEnabled=" << (g_logEnabled ? L"1" : L"0")
+        << L", log=" << (g_logPath.empty() ? L"<disabled>" : g_logPath);
     AppendLog(cfg.str());
 }
 
@@ -486,6 +496,12 @@ static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
         body += FromUtf8(b64);
         body += L"\"/>";
         outHtml = BuildShellHtmlWithBody(body, false);
+    }
+    if (outSvg) {
+        *outSvg = std::move(svgOut);
+    }
+    if (outPng) {
+        *outPng = std::move(pngOut);
     }
     if (outSvg) {
         *outSvg = std::move(svgOut);
@@ -1060,7 +1076,6 @@ static void InitWebView(struct Host* host){
                                                     std::wstring format = ToLowerTrim(ExtractJsonStringField(json, L"format"));
                                                     const bool preferSvg = format != L"png";
                                                     HostHandleFormatChange(host, preferSvg);
-                                                }
                                             } else if (rawJson) {
                                                 CoTaskMemFree(rawJson);
                                             }
