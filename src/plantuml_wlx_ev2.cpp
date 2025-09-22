@@ -7,7 +7,9 @@
 
 #include <windows.h>
 #include <shlwapi.h>
+#include <commdlg.h>
 #include <wrl.h>
+#include <wrl/event.h>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -20,6 +22,7 @@
 #include "WebView2.h"
 
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "Comdlg32.lib")
 
 using namespace Microsoft::WRL;
 
@@ -102,6 +105,31 @@ static void ReplaceAll(std::wstring& inout, const std::wstring& from, const std:
     }
 }
 
+static std::wstring ExtractJsonStringField(const std::wstring& json, const std::wstring& field) {
+    if (json.empty() || field.empty()) {
+        return std::wstring();
+    }
+    const std::wstring needle = L"\"" + field + L"\"";
+    size_t pos = json.find(needle);
+    if (pos == std::wstring::npos) {
+        return std::wstring();
+    }
+    pos = json.find(L':', pos + needle.size());
+    if (pos == std::wstring::npos) {
+        return std::wstring();
+    }
+    size_t quote = json.find_first_of(L"\"'", pos + 1);
+    if (quote == std::wstring::npos) {
+        return std::wstring();
+    }
+    const wchar_t delimiter = json[quote];
+    size_t end = json.find(delimiter, quote + 1);
+    if (end == std::wstring::npos) {
+        return std::wstring();
+    }
+    return json.substr(quote + 1, end - quote - 1);
+}
+
 static std::wstring FromUtf8(const std::string& s) {
     if (s.empty()) return std::wstring();
     int n = ::MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
@@ -146,6 +174,27 @@ static std::wstring ReadFileUtf16OrAnsi(const wchar_t* path) {
     std::wstring w(wlen, L'\0');
     MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)bytes.size(), w.data(), wlen);
     return w;
+}
+
+static bool WriteBufferToFile(const std::wstring& path, const void* data, size_t size) {
+    if (size > MAXDWORD) {
+        AppendLog(L"WriteBufferToFile: payload too large for Win32 WriteFile: " + std::to_wstring(static_cast<unsigned long long>(size)) + L" bytes");
+        return false;
+    }
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        AppendLog(L"WriteBufferToFile: failed to create file " + path + L" (error=" + std::to_wstring(GetLastError()) + L")");
+        return false;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(h, data, static_cast<DWORD>(size), &written, nullptr);
+    DWORD lastErr = ok ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(h);
+    if (!ok || written != size) {
+        AppendLog(L"WriteBufferToFile: failed to write file " + path + L" (error=" + std::to_wstring(lastErr) + L", written=" + std::to_wstring(written) + L"/" + std::to_wstring(static_cast<unsigned long long>(size)) + L")");
+        return false;
+    }
+    return true;
 }
 
 static bool TryAutoDetectPlantUmlJar(std::wstring& outPath) {
@@ -417,11 +466,13 @@ static bool RunPlantUmlJar(const std::wstring& umlTextW, bool preferSvg,
     return true;
 }
 
-static std::wstring BuildShellHtmlWithBody(const std::wstring& body);
+static std::wstring BuildShellHtmlWithBody(const std::wstring& body, bool preferSvg);
 
 static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
                                     bool preferSvg,
-                                    std::wstring& outHtml) {
+                                    std::wstring& outHtml,
+                                    std::wstring* outSvg,
+                                    std::vector<unsigned char>* outPng) {
     std::wstring svgOut;
     std::vector<unsigned char> pngOut;
     if (!RunPlantUmlJar(umlText, preferSvg, svgOut, pngOut)) {
@@ -429,19 +480,25 @@ static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
     }
 
     if (preferSvg) {
-        outHtml = BuildShellHtmlWithBody(svgOut);
+        outHtml = BuildShellHtmlWithBody(svgOut, true);
     } else {
         const std::string b64 = Base64(pngOut);
         std::wstring body = L"<img alt=\"diagram\" src=\"data:image/png;base64,";
         body += FromUtf8(b64);
         body += L"\"/>";
-        outHtml = BuildShellHtmlWithBody(body);
+        outHtml = BuildShellHtmlWithBody(body, false);
+    }
+    if (outSvg) {
+        *outSvg = std::move(svgOut);
+    }
+    if (outPng) {
+        *outPng = std::move(pngOut);
     }
     return true;
 }
 
 // Build minimal HTML wrapper with injected BODY (svg markup or <img src="data:...">)
-static std::wstring BuildShellHtmlWithBody(const std::wstring& body) {
+static std::wstring BuildShellHtmlWithBody(const std::wstring& body, bool preferSvg) {
     std::wstring html = LR"HTML(<!doctype html>
 <html>
 <head>
@@ -452,37 +509,148 @@ static std::wstring BuildShellHtmlWithBody(const std::wstring& body) {
   <style>
     :root { color-scheme: light dark; }
     html, body { height: 100%; }
-    body { margin: 0; background: canvas; color: CanvasText; font: 13px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-    #root { padding: 8px; display: grid; place-items: start center; }
+    body { margin: 0; background: canvas; color: CanvasText; font: 13px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; position: relative; }
+    #toolbar { position: fixed; top: 8px; left: 8px; display: flex; gap: 6px; z-index: 10; }
+    #toolbar button, #toolbar select { padding: 6px 10px; border-radius: 6px; border: 1px solid color-mix(in oklab, Canvas 70%, CanvasText 30%); background: color-mix(in oklab, Canvas 92%, CanvasText 8%); color: inherit; font: inherit; cursor: pointer; }
+    #toolbar button:hover, #toolbar select:hover { background: color-mix(in oklab, Canvas 88%, CanvasText 12%); }
+    #toolbar button:disabled, #toolbar select:disabled { opacity: 0.6; cursor: not-allowed; }
+    #root { padding: 56px 8px 8px 8px; display: grid; place-items: start center; }
     img, svg { max-width: 100%; height: auto; }
     .err { padding: 12px 14px; border-radius: 10px; background: color-mix(in oklab, Canvas 85%, red 15%); }
   </style>
 </head>
-<body>
+<body data-format="{{FORMAT}}">
+  <div id="toolbar">
+    <button id="btn-refresh" type="button">Refresh</button>
+    <button id="btn-save" type="button">Save as...</button>
+    <select id="format-select">
+      <option value="svg">SVG</option>
+      <option value="png">PNG</option>
+    </select>
+    <button id="btn-copy" type="button">Copy to clipboard</button>
+  </div>
   <div id="root">
     {{BODY}}
   </div>
   <script>
+    const hookButton = (btn, messageType) => {
+      if (!btn) {
+        return;
+      }
+      const update = () => {
+        const connected = !!(window.chrome && window.chrome.webview);
+        btn.disabled = !connected;
+        if (!connected) {
+          btn.title = 'Available inside Total Commander';
+          window.setTimeout(update, 1000);
+        } else {
+          btn.removeAttribute('title');
+        }
+      };
+      update();
+      btn.addEventListener('click', () => {
+        if (window.chrome && window.chrome.webview) {
+          window.chrome.webview.postMessage({ type: messageType });
+        }
+      });
+    };
+    hookButton(document.getElementById('btn-refresh'), 'refresh');
+    hookButton(document.getElementById('btn-save'), 'saveAs');
+    const select = document.getElementById('format-select');
+    if (select) {
+      const setDisabled = (disabled) => {
+        if (disabled) {
+          select.setAttribute('disabled', 'disabled');
+        } else {
+          select.removeAttribute('disabled');
+        }
+      };
+      const update = () => {
+        const connected = !!(window.chrome && window.chrome.webview);
+        setDisabled(!connected);
+        if (!connected) {
+          select.title = 'Available inside Total Commander';
+          window.setTimeout(update, 1000);
+        } else {
+          select.removeAttribute('title');
+        }
+      };
+      const initial = document.body?.dataset?.format;
+      if (initial) {
+        select.value = initial;
+      }
+      select.addEventListener('change', () => {
+        if (document.body && document.body.dataset) {
+          document.body.dataset.format = select.value;
+        }
+        if (typeof updateCopyState === 'function') {
+          updateCopyState();
+        }
+        if (window.chrome && window.chrome.webview) {
+          window.chrome.webview.postMessage({ type: 'setFormat', format: select.value });
+        }
+      });
+      update();
+    }
+    const copyButton = document.getElementById('btn-copy');
+    const copyDiagram = async () => {
+      if (!navigator.clipboard) {
+        return false;
+      }
+      const svg = document.querySelector('svg');
+      if (svg) {
+        const s = new XMLSerializer().serializeToString(svg);
+        await navigator.clipboard.writeText(s);
+        return true;
+      }
+      const img = document.querySelector('img');
+      if (img) {
+        if (!window.ClipboardItem) {
+          return false;
+        }
+        const c = document.createElement('canvas');
+        c.width = img.naturalWidth;
+        c.height = img.naturalHeight;
+        const g = c.getContext('2d');
+        g.drawImage(img, 0, 0);
+        const blob = await new Promise(r => c.toBlob(r, 'image/png'));
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        return true;
+      }
+      return false;
+    };
+    let updateCopyState = null;
+    if (copyButton) {
+      updateCopyState = () => {
+        const connected = !!(window.chrome && window.chrome.webview);
+        const format = document.body?.dataset?.format || 'svg';
+        const clipboardItemAvailable = typeof window.ClipboardItem !== 'undefined';
+        const canCopy = !!navigator.clipboard && (format !== 'png' || clipboardItemAvailable);
+        copyButton.disabled = !(connected && canCopy);
+        if (!connected) {
+          copyButton.title = 'Available inside Total Commander';
+          window.setTimeout(updateCopyState, 1000);
+        } else if (!canCopy) {
+          copyButton.title = format === 'png' && !clipboardItemAvailable
+            ? 'Clipboard image support is unavailable'
+            : 'Clipboard access is unavailable';
+        } else {
+          copyButton.removeAttribute('title');
+        }
+      };
+      updateCopyState();
+      copyButton.addEventListener('click', async () => {
+        try {
+          await copyDiagram();
+        } catch (e) {}
+      });
+    }
     // Ctrl+C copies SVG or PNG
     document.addEventListener('keydown', async ev => {
       if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'c') {
         ev.preventDefault();
         try {
-          const svg = document.querySelector('svg');
-          if (svg) {
-            const s = new XMLSerializer().serializeToString(svg);
-            await navigator.clipboard.writeText(s);
-            return;
-          }
-          const img = document.querySelector('img');
-          if (img) {
-            const c = document.createElement('canvas');
-            c.width = img.naturalWidth; c.height = img.naturalHeight;
-            const g = c.getContext('2d');
-            g.drawImage(img, 0, 0);
-            const blob = await new Promise(r => c.toBlob(r, 'image/png'));
-            await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-          }
+          await copyDiagram();
         } catch (e) {}
       }
     });
@@ -490,14 +658,15 @@ static std::wstring BuildShellHtmlWithBody(const std::wstring& body) {
 </body>
 </html>)HTML";
     ReplaceAll(html, L"{{BODY}}", body);
+    ReplaceAll(html, L"{{FORMAT}}", preferSvg ? L"svg" : L"png");
     return html;
 }
 
-static std::wstring BuildErrorHtml(const std::wstring& message) {
+static std::wstring BuildErrorHtml(const std::wstring& message, bool preferSvg) {
     std::wstring safe = message;
     ReplaceAll(safe, L"<", L"&lt;");
     ReplaceAll(safe, L">", L"&gt;");
-    return BuildShellHtmlWithBody(L"<div class='err'>"+safe+L"</div>");
+    return BuildShellHtmlWithBody(L"<div class='err'>"+safe+L"</div>", preferSvg);
 }
 
 // ---------------------- WebView host ----------------------
@@ -517,9 +686,16 @@ struct Host {
     ComPtr<ICoreWebView2Controller>  ctrl;
     ComPtr<ICoreWebView2>            web;
     EventRegistrationToken           navCompletedToken{};
+    EventRegistrationToken           webMessageToken{};
     bool                             navCompletedRegistered = false;
+    bool                             webMessageRegistered   = false;
 
     std::wstring initialHtml; // what we will NavigateToString()
+    std::wstring sourceFilePath;
+    std::wstring lastSvg;
+    std::vector<unsigned char> lastPng;
+    bool lastPreferSvg = true;
+    bool hasRender = false;
 };
 
 static void HostNavigateToInitialHtml(Host* host) {
@@ -546,6 +722,201 @@ static void HostRelease(Host* host) {
     }
 }
 
+static bool HostRenderAndReload(Host* host,
+                                bool preferSvg,
+                                const std::wstring& logContext,
+                                const std::wstring& failureDialogMessage,
+                                bool showDialogOnFailure) {
+    if (!host) {
+        return false;
+    }
+
+    std::wstring sourcePath;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        sourcePath = host->sourceFilePath;
+    }
+
+    if (sourcePath.empty()) {
+        AppendLog(logContext + L": no source path recorded");
+        {
+            std::lock_guard<std::mutex> lock(host->stateMutex);
+            host->lastPreferSvg = preferSvg;
+        }
+        if (showDialogOnFailure && host->hwnd) {
+            MessageBoxW(host->hwnd,
+                        L"Unable to render because the original file path is unknown.",
+                        L"PlantUML Viewer",
+                        MB_OK | MB_ICONERROR);
+        }
+        return false;
+    }
+
+    AppendLog(logContext + L": reloading file " + sourcePath);
+    const std::wstring text = ReadFileUtf16OrAnsi(sourcePath.c_str());
+    AppendLog(logContext + L": file characters=" + std::to_wstring(text.size()));
+
+    std::wstring html;
+    std::wstring svg;
+    std::vector<unsigned char> png;
+    std::wstring htmlToNavigate;
+
+    if (BuildHtmlFromJavaRender(text, preferSvg, html, &svg, &png)) {
+        AppendLog(logContext + L": render succeeded");
+        {
+            std::lock_guard<std::mutex> lock(host->stateMutex);
+            host->initialHtml = html;
+            host->lastSvg = std::move(svg);
+            host->lastPng = std::move(png);
+            host->lastPreferSvg = preferSvg;
+            host->hasRender = true;
+            htmlToNavigate = host->initialHtml;
+        }
+    } else {
+        AppendLog(logContext + L": render failed");
+        const std::wstring dialogMessage = failureDialogMessage.empty()
+            ? std::wstring(L"Unable to render the diagram. Check the log for details.")
+            : failureDialogMessage;
+        {
+            std::lock_guard<std::mutex> lock(host->stateMutex);
+            host->initialHtml = BuildErrorHtml(dialogMessage, preferSvg);
+            host->lastSvg.clear();
+            host->lastPng.clear();
+            host->lastPreferSvg = preferSvg;
+            host->hasRender = false;
+            htmlToNavigate = host->initialHtml;
+        }
+        if (showDialogOnFailure && host->hwnd) {
+            MessageBoxW(host->hwnd, dialogMessage.c_str(), L"PlantUML Viewer", MB_OK | MB_ICONERROR);
+        }
+    }
+
+    if (host->web && !htmlToNavigate.empty()) {
+        host->web->NavigateToString(htmlToNavigate.c_str());
+    }
+
+    return true;
+}
+
+static void HostHandleSaveAs(Host* host) {
+    if (!host) return;
+
+    std::wstring svgCopy;
+    std::vector<unsigned char> pngCopy;
+    std::wstring sourcePath;
+    bool preferSvg = true;
+    bool hasRender = false;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        hasRender = host->hasRender;
+        preferSvg = host->lastPreferSvg;
+        svgCopy = host->lastSvg;
+        pngCopy = host->lastPng;
+        sourcePath = host->sourceFilePath;
+    }
+
+    if (!hasRender) {
+        AppendLog(L"HostHandleSaveAs: no render available");
+        MessageBoxW(host->hwnd, L"There is no rendered diagram available to save.", L"PlantUML Viewer", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    const std::wstring defaultExt = preferSvg ? L"svg" : L"png";
+    std::wstring suggestedName = L"diagram." + defaultExt;
+    if (!sourcePath.empty()) {
+        const wchar_t* fileName = PathFindFileNameW(sourcePath.c_str());
+        if (fileName && *fileName) {
+            suggestedName.assign(fileName);
+            size_t dot = suggestedName.find_last_of(L'.');
+            if (dot != std::wstring::npos) {
+                suggestedName.erase(dot);
+            }
+            suggestedName += L"." + defaultExt;
+        }
+    }
+
+    std::wstring fileBuf(MAX_PATH, L'\0');
+    lstrcpynW(fileBuf.data(), suggestedName.c_str(), static_cast<int>(fileBuf.size()));
+
+    std::wstring filterSvg = L"Scalable Vector Graphics (*.svg)\0*.svg\0All Files (*.*)\0*.*\0\0";
+    std::wstring filterPng = L"Portable Network Graphics (*.png)\0*.png\0All Files (*.*)\0*.*\0\0";
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = host->hwnd;
+    ofn.lpstrFile = fileBuf.data();
+    ofn.nMaxFile = static_cast<DWORD>(fileBuf.size());
+    ofn.lpstrFilter = preferSvg ? filterSvg.c_str() : filterPng.c_str();
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt = defaultExt.c_str();
+    ofn.lpstrTitle = L"Save PlantUML Output";
+
+    if (!GetSaveFileNameW(&ofn)) {
+        DWORD dlgErr = CommDlgExtendedError();
+        if (dlgErr != 0) {
+            AppendLog(L"HostHandleSaveAs: GetSaveFileNameW failed (CommDlgExtendedError=" + std::to_wstring(dlgErr) + L")");
+            MessageBoxW(host->hwnd, L"Unable to open the save dialog.", L"PlantUML Viewer", MB_OK | MB_ICONERROR);
+        } else {
+            AppendLog(L"HostHandleSaveAs: user cancelled save dialog");
+        }
+        return;
+    }
+
+    std::wstring savePath(ofn.lpstrFile);
+    bool success = false;
+    if (preferSvg) {
+        std::string utf8 = ToUtf8(svgCopy);
+        if (!svgCopy.empty() && utf8.empty()) {
+            AppendLog(L"HostHandleSaveAs: failed to encode SVG as UTF-8");
+            success = false;
+        } else {
+            success = WriteBufferToFile(savePath, utf8.data(), utf8.size());
+        }
+    } else {
+        success = WriteBufferToFile(savePath, pngCopy.data(), pngCopy.size());
+    }
+
+    if (!success) {
+        MessageBoxW(host->hwnd, L"Failed to save the file.", L"PlantUML Viewer", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    AppendLog(L"HostHandleSaveAs: saved diagram to " + savePath);
+}
+
+static void HostHandleRefresh(Host* host) {
+    if (!host) return;
+
+    bool preferSvg = true;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        preferSvg = host->lastPreferSvg;
+    }
+
+    HostRenderAndReload(host,
+                        preferSvg,
+                        L"HostHandleRefresh",
+                        L"Unable to refresh the diagram. Check the log for details.",
+                        true);
+}
+
+static void HostHandleFormatChange(Host* host, bool preferSvg) {
+    if (!host) return;
+
+    const std::wstring formatLabel = preferSvg ? L"svg" : L"png";
+    const std::wstring logContext = std::wstring(L"HostHandleFormatChange(") + formatLabel + L")";
+    const std::wstring errorMessage = preferSvg
+        ? std::wstring(L"Unable to render the diagram as SVG. Check the log for details.")
+        : std::wstring(L"Unable to render the diagram as PNG. Check the log for details.");
+
+    HostRenderAndReload(host,
+                        preferSvg,
+                        logContext,
+                        errorMessage,
+                        true);
+}
+
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
     PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions*,
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
@@ -566,6 +937,11 @@ static LRESULT CALLBACK HostWndProc(HWND h, UINT m, WPARAM w, LPARAM l){
             if (host->web && host->navCompletedRegistered) {
                 host->web->remove_NavigationCompleted(host->navCompletedToken);
                 host->navCompletedRegistered = false;
+                HostRelease(host);
+            }
+            if (host->web && host->webMessageRegistered) {
+                host->web->remove_WebMessageReceived(host->webMessageToken);
+                host->webMessageRegistered = false;
                 HostRelease(host);
             }
             if(host->ctrl) host->ctrl->Close();
@@ -617,92 +993,136 @@ static void InitWebView(struct Host* host){
 
     AppendLog(L"InitWebView: creating environment");
     HostAddRef(host);
-    HRESULT hrEnv = fn(nullptr, nullptr, nullptr,
-        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-            [host](HRESULT hr, ICoreWebView2Environment* env)->HRESULT{
-                std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
-                if(!host || host->closing.load(std::memory_order_acquire)){
-                    AppendLog(L"InitWebView: host closing before environment callback");
-                    return S_OK;
-                }
-                if(FAILED(hr) || !env){
-                    AppendLog(L"InitWebView: environment creation failed with HRESULT=" + std::to_wstring(hr));
-                    return S_OK;
-                }
-                AppendLog(L"InitWebView: environment ready");
-                host->env = env;
-                HostAddRef(host);
-                HRESULT hrCtrl = env->CreateCoreWebView2Controller(host->hwnd,
-                    Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                        [host](HRESULT hr, ICoreWebView2Controller* ctrl)->HRESULT{
+    auto envCompleted = Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+        [host](HRESULT hr, ICoreWebView2Environment* env) -> HRESULT {
+            std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+            if(!host || host->closing.load(std::memory_order_acquire)){
+                AppendLog(L"InitWebView: host closing before environment callback");
+                return S_OK;
+            }
+            if(FAILED(hr) || !env){
+                AppendLog(L"InitWebView: environment creation failed with HRESULT=" + std::to_wstring(hr));
+                return S_OK;
+            }
+            AppendLog(L"InitWebView: environment ready");
+            host->env = env;
+
+            HostAddRef(host);
+            auto controllerCompleted = Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [host](HRESULT hrCtrl, ICoreWebView2Controller* ctrl) -> HRESULT {
+                    std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                    if(!host || host->closing.load(std::memory_order_acquire)){
+                        AppendLog(L"InitWebView: host closing before controller callback");
+                        return S_OK;
+                    }
+                    if(FAILED(hrCtrl) || !ctrl){
+                        AppendLog(L"InitWebView: controller creation failed with HRESULT=" + std::to_wstring(hrCtrl));
+                        return S_OK;
+                    }
+                    AppendLog(L"InitWebView: controller ready");
+                    host->ctrl = ctrl;
+                    host->ctrl->get_CoreWebView2(&host->web);
+                    if (!host->web) {
+                        AppendLog(L"InitWebView: failed to get CoreWebView2 interface");
+                        return S_OK;
+                    }
+                    AppendLog(L"InitWebView: CoreWebView2 obtained");
+                    if(!host->hwnd){
+                        AppendLog(L"InitWebView: window destroyed before bounds update");
+                        return S_OK;
+                    }
+                    RECT rc; GetClientRect(host->hwnd, &rc);
+                    host->ctrl->put_Bounds(rc);
+
+                    HostAddRef(host);
+                    auto webMessageHandler = Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                        [host](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
                             std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
                             if(!host || host->closing.load(std::memory_order_acquire)){
-                                AppendLog(L"InitWebView: host closing before controller callback");
                                 return S_OK;
                             }
-                            if(FAILED(hr) || !ctrl){
-                                AppendLog(L"InitWebView: controller creation failed with HRESULT=" + std::to_wstring(hr));
+                            if (!args) {
                                 return S_OK;
                             }
-                            AppendLog(L"InitWebView: controller ready");
-                            host->ctrl = ctrl;
-                            host->ctrl->get_CoreWebView2(&host->web);
-                            if (!host->web) {
-                                AppendLog(L"InitWebView: failed to get CoreWebView2 interface");
-                                return S_OK;
-                            }
-                            AppendLog(L"InitWebView: CoreWebView2 obtained");
-                            if(!host->hwnd){
-                                AppendLog(L"InitWebView: window destroyed before bounds update");
-                                return S_OK;
-                            }
-                            RECT rc; GetClientRect(host->hwnd, &rc);
-                            host->ctrl->put_Bounds(rc);
-                            if (host->web) {
-                                HostAddRef(host);
-                                EventRegistrationToken navToken{};
-                                HRESULT hrNav = host->web->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                    [host](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args)->HRESULT{
-                                        std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
-                                        if(!host || host->closing.load(std::memory_order_acquire)){
-                                            return S_OK;
-                                        }
-                                        UINT64 navId = 0;
-                                        if (args) args->get_NavigationId(&navId);
-                                        BOOL isSuccess = FALSE;
-                                        if (args) args->get_IsSuccess(&isSuccess);
-                                        COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
-                                        if (args) args->get_WebErrorStatus(&status);
-                                        std::wstringstream os;
-                                        os << L"InitWebView: NavigationCompleted id=" << navId
-                                           << L", success=" << (isSuccess ? L"true" : L"false")
-                                           << L", webErrorStatus=" << static_cast<int>(status);
-                                        AppendLog(os.str());
-                                        return S_OK;
-                                    }).Get(), &navToken);
-                                if (SUCCEEDED(hrNav)) {
-                                    host->navCompletedToken = navToken;
-                                    host->navCompletedRegistered = true;
-                                } else {
-                                    AppendLog(L"InitWebView: add_NavigationCompleted failed with HRESULT=" + std::to_wstring(hrNav));
-                                    HostRelease(host);
+                            LPWSTR rawJson = nullptr;
+                            HRESULT hrJson = args->get_WebMessageAsJson(&rawJson);
+                            if (SUCCEEDED(hrJson) && rawJson) {
+                                std::wstring json(rawJson);
+                                CoTaskMemFree(rawJson);
+                                const std::wstring type = ToLowerTrim(ExtractJsonStringField(json, L"type"));
+                                if (type == L"saveas") {
+                                    HostHandleSaveAs(host);
+                                } else if (type == L"refresh") {
+                                    HostHandleRefresh(host);
+                                } else if (type == L"setformat") {
+                                    std::wstring format = ToLowerTrim(ExtractJsonStringField(json, L"format"));
+                                    const bool preferSvg = format != L"png";
+                                    HostHandleFormatChange(host, preferSvg);
                                 }
+                            } else if (rawJson) {
+                                CoTaskMemFree(rawJson);
                             }
-                            {
-                                std::lock_guard<std::mutex> lock(host->stateMutex);
-                                if (!host->initialHtml.empty()){
-                                    AppendLog(L"InitWebView: navigating to initial HTML (" + std::to_wstring(host->initialHtml.size()) + L" chars)");
-                                }
-                            }
-                            HostNavigateToInitialHtml(host);
                             return S_OK;
-                        }).Get());
-                if(FAILED(hrCtrl)){
-                    AppendLog(L"InitWebView: CreateCoreWebView2Controller call failed with HRESULT=" + std::to_wstring(hrCtrl));
-                    HostRelease(host);
-                }
-                return S_OK;
-            }).Get());
+                        });
+                    EventRegistrationToken msgToken{};
+                    HRESULT hrMsg = host->web->add_WebMessageReceived(webMessageHandler.Get(), &msgToken);
+                    if (SUCCEEDED(hrMsg)) {
+                        host->webMessageToken = msgToken;
+                        host->webMessageRegistered = true;
+                    } else {
+                        AppendLog(L"InitWebView: add_WebMessageReceived failed with HRESULT=" + std::to_wstring(hrMsg));
+                        HostRelease(host);
+                    }
+
+                    HostAddRef(host);
+                    auto navCompletedHandler = Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                        [host](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
+                            std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
+                            if(!host || host->closing.load(std::memory_order_acquire)){
+                                return S_OK;
+                            }
+                            UINT64 navId = 0;
+                            if (args) args->get_NavigationId(&navId);
+                            BOOL isSuccess = FALSE;
+                            if (args) args->get_IsSuccess(&isSuccess);
+                            COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
+                            if (args) args->get_WebErrorStatus(&status);
+                            std::wstringstream os;
+                            os << L"InitWebView: NavigationCompleted id=" << navId
+                               << L", success=" << (isSuccess ? L"true" : L"false")
+                               << L", webErrorStatus=" << static_cast<int>(status);
+                            AppendLog(os.str());
+                            return S_OK;
+                        });
+                    EventRegistrationToken navToken{};
+                    HRESULT hrNav = host->web->add_NavigationCompleted(navCompletedHandler.Get(), &navToken);
+                    if (SUCCEEDED(hrNav)) {
+                        host->navCompletedToken = navToken;
+                        host->navCompletedRegistered = true;
+                    } else {
+                        AppendLog(L"InitWebView: add_NavigationCompleted failed with HRESULT=" + std::to_wstring(hrNav));
+                        HostRelease(host);
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(host->stateMutex);
+                        if (!host->initialHtml.empty()){
+                            AppendLog(L"InitWebView: navigating to initial HTML (" + std::to_wstring(host->initialHtml.size()) + L" chars)");
+                        }
+                    }
+                    HostNavigateToInitialHtml(host);
+                    return S_OK;
+                });
+
+            HRESULT hrCtrl = env->CreateCoreWebView2Controller(host->hwnd, controllerCompleted.Get());
+            if(FAILED(hrCtrl)){
+                AppendLog(L"InitWebView: CreateCoreWebView2Controller call failed with HRESULT=" + std::to_wstring(hrCtrl));
+                HostRelease(host);
+            }
+            return S_OK;
+        });
+
+    HRESULT hrEnv = fn(nullptr, nullptr, nullptr, envCompleted.Get());
     if(FAILED(hrEnv)){
         AppendLog(L"InitWebView: CreateCoreWebView2EnvironmentWithOptions call failed with HRESULT=" + std::to_wstring(hrEnv));
         HostRelease(host);
@@ -743,15 +1163,26 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
 
     AppendLog(L"ListLoadW: attempting local Java render with jar=" + (g_jarPath.empty() ? std::wstring(L"<auto>") : g_jarPath));
     std::wstring html;
-    if (BuildHtmlFromJavaRender(text, preferSvg, html)) {
+    if (BuildHtmlFromJavaRender(text, preferSvg, html, &host->lastSvg, &host->lastPng)) {
         {
             std::lock_guard<std::mutex> lock(host->stateMutex);
             host->initialHtml = html;
+            host->sourceFilePath = FileToLoad ? std::wstring(FileToLoad) : std::wstring();
+            host->lastPreferSvg = preferSvg;
+            host->hasRender = true;
         }
         AppendLog(L"ListLoadW: local render succeeded" + std::wstring(preferSvg ? L" (SVG)" : L" (PNG)"));
     } else {
         const std::wstring lastErr = L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.";
-        host->initialHtml = BuildErrorHtml(lastErr);
+        {
+            std::lock_guard<std::mutex> lock(host->stateMutex);
+            host->initialHtml = BuildErrorHtml(lastErr, preferSvg);
+            host->sourceFilePath = FileToLoad ? std::wstring(FileToLoad) : std::wstring();
+            host->lastPreferSvg = preferSvg;
+            host->lastSvg.clear();
+            host->lastPng.clear();
+            host->hasRender = false;
+        }
         AppendLog(L"ListLoadW: java error message -> " + lastErr);
         AppendLog(L"ListLoadW: local render failed");
         AppendLog(L"ListLoadW: showing error HTML");
