@@ -19,10 +19,13 @@
 #include <mutex>
 #include <cwchar>
 
+#include <wincodec.h>
+
 #include "WebView2.h"
 
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "Comdlg32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 using namespace Microsoft::WRL;
 
@@ -80,6 +83,157 @@ static void AppendLog(const std::wstring& message) {
         WriteFile(h, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
     }
     CloseHandle(h);
+}
+
+static bool ClipboardSetUnicodeText(const std::wstring& text) {
+    const size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!mem) {
+        return false;
+    }
+    void* ptr = GlobalLock(mem);
+    if (!ptr) {
+        GlobalFree(mem);
+        return false;
+    }
+    memcpy(ptr, text.c_str(), bytes);
+    GlobalUnlock(mem);
+    if (!SetClipboardData(CF_UNICODETEXT, mem)) {
+        GlobalFree(mem);
+        return false;
+    }
+    return true;
+}
+
+static bool ClipboardSetBinaryData(UINT format, const void* data, size_t size) {
+    if (!data || !size) {
+        return false;
+    }
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!mem) {
+        return false;
+    }
+    void* ptr = GlobalLock(mem);
+    if (!ptr) {
+        GlobalFree(mem);
+        return false;
+    }
+    memcpy(ptr, data, size);
+    GlobalUnlock(mem);
+    if (!SetClipboardData(format, mem)) {
+        GlobalFree(mem);
+        return false;
+    }
+    return true;
+}
+
+static bool CreateDibFromPng(const std::vector<unsigned char>& png,
+                             std::vector<unsigned char>& outDib) {
+    outDib.clear();
+    if (png.empty()) {
+        return false;
+    }
+
+    HRESULT hrInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool needUninit = false;
+    if (hrInit == RPC_E_CHANGED_MODE) {
+        hrInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (hrInit == RPC_E_CHANGED_MODE) {
+            hrInit = S_OK;
+        } else if (SUCCEEDED(hrInit)) {
+            needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+        }
+    } else if (SUCCEEDED(hrInit)) {
+        needUninit = (hrInit == S_OK || hrInit == S_FALSE);
+    }
+
+    if (FAILED(hrInit)) {
+        return false;
+    }
+
+    ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&factory));
+    if (FAILED(hr) || !factory) {
+        if (needUninit) CoUninitialize();
+        return false;
+    }
+
+    IStream* rawStream = SHCreateMemStream(png.data(), static_cast<UINT>(png.size()));
+    if (!rawStream) {
+        if (needUninit) CoUninitialize();
+        return false;
+    }
+    ComPtr<IStream> stream;
+    stream.Attach(rawStream);
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    hr = factory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad,
+                                          &decoder);
+    if (FAILED(hr) || !decoder) {
+        if (needUninit) CoUninitialize();
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    hr = decoder->GetFrame(0, &frame);
+    if (FAILED(hr) || !frame) {
+        if (needUninit) CoUninitialize();
+        return false;
+    }
+
+    ComPtr<IWICFormatConverter> converter;
+    hr = factory->CreateFormatConverter(&converter);
+    if (FAILED(hr) || !converter) {
+        if (needUninit) CoUninitialize();
+        return false;
+    }
+
+    hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
+                               WICBitmapDitherTypeNone, nullptr, 0.0f,
+                               WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) {
+        if (needUninit) CoUninitialize();
+        return false;
+    }
+
+    UINT width = 0, height = 0;
+    hr = converter->GetSize(&width, &height);
+    if (FAILED(hr) || width == 0 || height == 0) {
+        if (needUninit) CoUninitialize();
+        return false;
+    }
+
+    const UINT stride = width * 4;
+    const UINT imageSize = stride * height;
+    outDib.resize(sizeof(BITMAPV5HEADER) + imageSize);
+    auto* header = reinterpret_cast<BITMAPV5HEADER*>(outDib.data());
+    ZeroMemory(header, sizeof(BITMAPV5HEADER));
+    header->bV5Size = sizeof(BITMAPV5HEADER);
+    header->bV5Width = static_cast<LONG>(width);
+    header->bV5Height = -static_cast<LONG>(height);
+    header->bV5Planes = 1;
+    header->bV5BitCount = 32;
+    header->bV5Compression = BI_BITFIELDS;
+    header->bV5RedMask   = 0x00FF0000;
+    header->bV5GreenMask = 0x0000FF00;
+    header->bV5BlueMask  = 0x000000FF;
+    header->bV5AlphaMask = 0xFF000000;
+    header->bV5SizeImage = imageSize;
+
+    BYTE* pixels = outDib.data() + sizeof(BITMAPV5HEADER);
+    hr = converter->CopyPixels(nullptr, stride, imageSize, pixels);
+
+    if (needUninit) {
+        CoUninitialize();
+    }
+
+    if (FAILED(hr)) {
+        outDib.clear();
+        return false;
+    }
+
+    return true;
 }
 
 // ---------------------- Helpers ----------------------
@@ -504,12 +658,6 @@ static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
     if (outPng) {
         *outPng = std::move(pngOut);
     }
-    if (outSvg) {
-        *outSvg = std::move(svgOut);
-    }
-    if (outPng) {
-        *outPng = std::move(pngOut);
-    }
     return true;
 }
 
@@ -609,7 +757,7 @@ static std::wstring BuildShellHtmlWithBody(const std::wstring& body, bool prefer
       update();
     }
     const copyButton = document.getElementById('btn-copy');
-    const copyDiagram = async () => {
+    const copyWithWebApi = async () => {
       if (!navigator.clipboard) {
         return false;
       }
@@ -635,39 +783,45 @@ static std::wstring BuildShellHtmlWithBody(const std::wstring& body, bool prefer
       }
       return false;
     };
+    const triggerCopy = async () => {
+      try {
+        if (window.chrome && window.chrome.webview) {
+          window.chrome.webview.postMessage({ type: 'copy' });
+        } else {
+          await copyWithWebApi();
+        }
+      } catch (e) {}
+    };
     let updateCopyState = null;
     if (copyButton) {
       updateCopyState = () => {
         const connected = !!(window.chrome && window.chrome.webview);
         const format = document.body?.dataset?.format || 'svg';
         const clipboardItemAvailable = typeof window.ClipboardItem !== 'undefined';
-        const canCopy = !!navigator.clipboard && (format !== 'png' || clipboardItemAvailable);
-        copyButton.disabled = !(connected && canCopy);
-        if (!connected) {
-          copyButton.title = 'Available inside Total Commander';
+        const webApiAvailable = !!navigator.clipboard && (format !== 'png' || clipboardItemAvailable);
+        if (connected) {
+          copyButton.disabled = false;
+          copyButton.removeAttribute('title');
+        } else if (webApiAvailable) {
+          copyButton.disabled = false;
+          copyButton.title = 'Host unavailable – using browser clipboard';
           window.setTimeout(updateCopyState, 1000);
-        } else if (!canCopy) {
+        } else {
+          copyButton.disabled = true;
           copyButton.title = format === 'png' && !clipboardItemAvailable
             ? 'Clipboard image support is unavailable'
             : 'Clipboard access is unavailable';
-        } else {
-          copyButton.removeAttribute('title');
+          window.setTimeout(updateCopyState, 1000);
         }
       };
       updateCopyState();
-      copyButton.addEventListener('click', async () => {
-        try {
-          await copyDiagram();
-        } catch (e) {}
-      });
+      copyButton.addEventListener('click', triggerCopy);
     }
     // Ctrl+C copies SVG or PNG
     document.addEventListener('keydown', async ev => {
       if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'c') {
         ev.preventDefault();
-        try {
-          await copyDiagram();
-        } catch (e) {}
+        await triggerCopy();
       }
     });
   </script>
@@ -933,6 +1087,103 @@ static void HostHandleFormatChange(Host* host, bool preferSvg) {
                         true);
 }
 
+static void HostHandleCopy(Host* host) {
+    if (!host) {
+        return;
+    }
+
+    std::wstring svgCopy;
+    std::vector<unsigned char> pngCopy;
+    bool preferSvg = true;
+    bool hasRender = false;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        hasRender = host->hasRender;
+        preferSvg = host->lastPreferSvg;
+        svgCopy = host->lastSvg;
+        pngCopy = host->lastPng;
+    }
+
+    if (!hasRender) {
+        AppendLog(L"HostHandleCopy: no render available");
+        MessageBoxW(host->hwnd,
+                    L"There is no rendered diagram available to copy.",
+                    L"PlantUML Viewer",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    if (!OpenClipboard(host->hwnd)) {
+        AppendLog(L"HostHandleCopy: OpenClipboard failed with error " + std::to_wstring(GetLastError()));
+        MessageBoxW(host->hwnd,
+                    L"Unable to access the clipboard.",
+                    L"PlantUML Viewer",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    bool emptied = EmptyClipboard() != FALSE;
+    if (!emptied) {
+        AppendLog(L"HostHandleCopy: EmptyClipboard failed with error " + std::to_wstring(GetLastError()));
+        CloseClipboard();
+        MessageBoxW(host->hwnd,
+                    L"Unable to clear the clipboard.",
+                    L"PlantUML Viewer",
+                    MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    bool success = false;
+
+    if (preferSvg) {
+        if (!svgCopy.empty()) {
+            success = ClipboardSetUnicodeText(svgCopy);
+            if (!success) {
+                AppendLog(L"HostHandleCopy: failed to place SVG text on the clipboard");
+            }
+        } else {
+            AppendLog(L"HostHandleCopy: SVG buffer is empty");
+        }
+    } else {
+        if (!pngCopy.empty()) {
+            std::vector<unsigned char> dib;
+            bool dibOk = false;
+            if (CreateDibFromPng(pngCopy, dib)) {
+                dibOk = ClipboardSetBinaryData(CF_DIB, dib.data(), dib.size());
+                if (!dibOk) {
+                    AppendLog(L"HostHandleCopy: failed to place CF_DIB bitmap on the clipboard");
+                }
+            } else {
+                AppendLog(L"HostHandleCopy: failed to convert PNG to DIB");
+            }
+            UINT pngFormat = RegisterClipboardFormatW(L"PNG");
+            bool pngOk = false;
+            if (pngFormat != 0) {
+                pngOk = ClipboardSetBinaryData(pngFormat, pngCopy.data(), pngCopy.size());
+                if (!pngOk) {
+                    AppendLog(L"HostHandleCopy: failed to place PNG data on the clipboard");
+                }
+            } else {
+                AppendLog(L"HostHandleCopy: RegisterClipboardFormatW(PNG) failed");
+            }
+            success = dibOk || pngOk;
+        } else {
+            AppendLog(L"HostHandleCopy: PNG buffer is empty");
+        }
+    }
+
+    CloseClipboard();
+
+    if (!success) {
+        MessageBoxW(host->hwnd,
+                    L"Failed to copy the diagram to the clipboard.",
+                    L"PlantUML Viewer",
+                    MB_OK | MB_ICONERROR);
+    } else {
+        AppendLog(L"HostHandleCopy: copied diagram as " + std::wstring(preferSvg ? L"SVG" : L"PNG"));
+    }
+}
+
 typedef HRESULT (STDAPICALLTYPE *PFN_CreateCoreWebView2EnvironmentWithOptions)(
     PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions*,
     ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler*);
@@ -1076,6 +1327,8 @@ static void InitWebView(struct Host* host){
                                     std::wstring format = ToLowerTrim(ExtractJsonStringField(json, L"format"));
                                     const bool preferSvg = format != L"png";
                                     HostHandleFormatChange(host, preferSvg);
+                                } else if (type == L"copy") {
+                                    HostHandleCopy(host);
                                 }
                             } else if (rawJson) {
                                 CoTaskMemFree(rawJson);
