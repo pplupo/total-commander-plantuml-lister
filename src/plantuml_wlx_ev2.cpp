@@ -1054,93 +1054,28 @@ static void InitWebView(struct Host* host){
                     auto webMessageHandler = Callback<ICoreWebView2WebMessageReceivedEventHandler>(
                         [host](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
                             std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
-                            if(!host || host->closing.load(std::memory_order_acquire)){
+                            if (!host || host->closing.load(std::memory_order_acquire)) {
                                 return S_OK;
                             }
                             if (!args) {
                                 return S_OK;
                             }
-                            AppendLog(L"InitWebView: controller ready");
-                            host->ctrl = ctrl;
-                            host->ctrl->get_CoreWebView2(&host->web);
-                            if (!host->web) {
-                                AppendLog(L"InitWebView: failed to get CoreWebView2 interface");
-                                return S_OK;
-                            }
-                            AppendLog(L"InitWebView: CoreWebView2 obtained");
-                            if(!host->hwnd){
-                                AppendLog(L"InitWebView: window destroyed before bounds update");
-                                return S_OK;
-                            }
-                            RECT rc; GetClientRect(host->hwnd, &rc);
-                            host->ctrl->put_Bounds(rc);
-                            if (host->web) {
-                                {
-                                    HostAddRef(host);
-                                    EventRegistrationToken msgToken{};
-                                    HRESULT hrMsg = host->web->add_WebMessageReceived(Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                        [host](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args)->HRESULT{
-                                            std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
-                                            if(!host || host->closing.load(std::memory_order_acquire)){
-                                                return S_OK;
-                                            }
-                                            if (!args) {
-                                                return S_OK;
-                                            }
-                                            LPWSTR rawJson = nullptr;
-                                            HRESULT hrJson = args->get_WebMessageAsJson(&rawJson);
-                                            if (SUCCEEDED(hrJson) && rawJson) {
-                                                std::wstring json(rawJson);
-                                                CoTaskMemFree(rawJson);
-                                                const std::wstring type = ToLowerTrim(ExtractJsonStringField(json, L"type"));
-                                                if (type == L"saveas") {
-                                                    HostHandleSaveAs(host);
-                                                } else if (type == L"refresh") {
-                                                    HostHandleRefresh(host);
-                                                } else if (type == L"setformat") {
-                                                    std::wstring format = ToLowerTrim(ExtractJsonStringField(json, L"format"));
-                                                    const bool preferSvg = format != L"png";
-                                                    HostHandleFormatChange(host, preferSvg);
-                                            } else if (rawJson) {
-                                                CoTaskMemFree(rawJson);
-                                            }
-                                            return S_OK;
-                                        }).Get(), &msgToken);
-                                    if (SUCCEEDED(hrMsg)) {
-                                        host->webMessageToken = msgToken;
-                                        host->webMessageRegistered = true;
-                                    } else {
-                                        AppendLog(L"InitWebView: add_WebMessageReceived failed with HRESULT=" + std::to_wstring(hrMsg));
-                                        HostRelease(host);
-                                    }
-                                }
-                                HostAddRef(host);
-                                EventRegistrationToken navToken{};
-                                HRESULT hrNav = host->web->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
-                                    [host](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs* args)->HRESULT{
-                                        std::unique_ptr<Host, decltype(&HostRelease)> guard(host, &HostRelease);
-                                        if(!host || host->closing.load(std::memory_order_acquire)){
-                                            return S_OK;
-                                        }
-                                        UINT64 navId = 0;
-                                        if (args) args->get_NavigationId(&navId);
-                                        BOOL isSuccess = FALSE;
-                                        if (args) args->get_IsSuccess(&isSuccess);
-                                        COREWEBVIEW2_WEB_ERROR_STATUS status = COREWEBVIEW2_WEB_ERROR_STATUS_UNKNOWN;
-                                        if (args) args->get_WebErrorStatus(&status);
-                                        std::wstringstream os;
-                                        os << L"InitWebView: NavigationCompleted id=" << navId
-                                           << L", success=" << (isSuccess ? L"true" : L"false")
-                                           << L", webErrorStatus=" << static_cast<int>(status);
-                                        AppendLog(os.str());
-                                        return S_OK;
-                                    }).Get(), &navToken);
-                                if (SUCCEEDED(hrNav)) {
-                                    host->navCompletedToken = navToken;
-                                    host->navCompletedRegistered = true;
-                                } else {
-                                    AppendLog(L"InitWebView: add_NavigationCompleted failed with HRESULT=" + std::to_wstring(hrNav));
-                                    HostRelease(host);
+
+                            LPWSTR rawJson = nullptr;
+                            HRESULT hrJson = args->get_WebMessageAsJson(&rawJson);
+                            if (SUCCEEDED(hrJson) && rawJson) {
+                                std::wstring json(rawJson);
+                                CoTaskMemFree(rawJson);
+
+                                const std::wstring type = ToLowerTrim(ExtractJsonStringField(json, L"type"));
+                                if (type == L"saveas") {
+                                    HostHandleSaveAs(host);
+                                } else if (type == L"refresh") {
+                                    HostHandleRefresh(host);
+                                } else if (type == L"setformat") {
+                                    std::wstring format = ToLowerTrim(ExtractJsonStringField(json, L"format"));
+                                    const bool preferSvg = format != L"png";
+                                    HostHandleFormatChange(host, preferSvg);
                                 }
                             } else if (rawJson) {
                                 CoTaskMemFree(rawJson);
