@@ -998,7 +998,7 @@ static bool BuildHtmlFromWebRender(const std::wstring& umlText,
     }
     const std::wstring safeSourceName = HtmlAttributeEscape(sourceName);
 
-    std::wstring html = LR"HTML(<!doctype html>
+    static const wchar_t kWebShellPart1[] = LR"HTML1(<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -1280,7 +1280,9 @@ static bool BuildHtmlFromWebRender(const std::wstring& umlText,
           console.warn('Failed to notify host about render failure', err);
         }
       };
+)HTML1";
 
+    static const wchar_t kWebShellPart2[] = LR"HTML2(
       const renderDiagram = async () => {
         const format = getFormat();
         const source = getSource();
@@ -1375,7 +1377,9 @@ static bool BuildHtmlFromWebRender(const std::wstring& umlText,
           updateCopyState();
         }
       };
+)HTML2";
 
+    static const wchar_t kWebShellPart3[] = LR"HTML3(
       if (formatSelect) {
         const stored = (() => {
           try {
@@ -1461,8 +1465,12 @@ static bool BuildHtmlFromWebRender(const std::wstring& umlText,
     })();
   </script>
 </body>
-</html>)HTML";
+</html>
+)HTML3";
 
+    std::wstring html(kWebShellPart1);
+    html.append(kWebShellPart2);
+    html.append(kWebShellPart3);
     ReplaceAll(html, L"{{FORMAT}}", preferSvg ? L"svg" : L"png");
     ReplaceAll(html, L"{{SOURCE_NAME}}", safeSourceName);
     ReplaceAll(html, L"{{PLANTUML_SOURCE}}", escaped);
