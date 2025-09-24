@@ -1377,7 +1377,6 @@ static bool BuildHtmlFromWebRender(const std::wstring& umlText,
           updateCopyState();
         }
       };
-
 )HTML2";
 
     static const wchar_t kWebShellPart3[] = LR"HTML3(
@@ -1472,7 +1471,6 @@ static bool BuildHtmlFromWebRender(const std::wstring& umlText,
     std::wstring html(kWebShellPart1);
     html.append(kWebShellPart2);
     html.append(kWebShellPart3);
-
     ReplaceAll(html, L"{{FORMAT}}", preferSvg ? L"svg" : L"png");
     ReplaceAll(html, L"{{SOURCE_NAME}}", safeSourceName);
     ReplaceAll(html, L"{{PLANTUML_SOURCE}}", escaped);
