@@ -30,8 +30,9 @@
 using namespace Microsoft::WRL;
 
 // ---------------------- Config ----------------------
-static std::wstring g_prefer    = L"svg";           // "svg" or "png"
-static std::string  g_detectA   = R"(EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUML")";
+static std::wstring g_prefer          = L"svg";           // "svg" or "png"
+static std::wstring g_rendererPipeline = L"java";        // e.g. "java", "web", "web,java"
+static std::string  g_detectA         = R"(EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUML")";
 
 static std::wstring g_jarPath;                      // If empty: auto-detect moduleDir\plantuml.jar
 static std::wstring g_javaPath;                     // Optional explicit java[w].exe
@@ -43,6 +44,19 @@ static bool         g_cfgLoaded = false;
 
 static std::mutex   g_logMutex;
 static bool         g_logSessionStarted = false;
+
+enum class RenderBackend {
+    Java,
+    Web,
+};
+
+static const wchar_t* RenderBackendName(RenderBackend backend) {
+    switch (backend) {
+    case RenderBackend::Java: return L"java";
+    case RenderBackend::Web:  return L"web";
+    }
+    return L"unknown";
+}
 
 static std::string ToUtf8(const std::wstring& w);
 
@@ -385,6 +399,7 @@ static void LoadConfigIfNeeded() {
     wchar_t buf[2048];
 
     if (GetPrivateProfileStringW(L"render", L"prefer", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_prefer = buf;
+    if (GetPrivateProfileStringW(L"render", L"pipeline", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_rendererPipeline = buf;
 
     if (GetPrivateProfileStringW(L"detect", L"string", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
         int need = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
@@ -440,6 +455,7 @@ static void LoadConfigIfNeeded() {
 
     std::wstringstream cfg;
     cfg << L"Config loaded. prefer=" << g_prefer
+        << L", pipeline=" << g_rendererPipeline
         << L", jar=" << (g_jarPath.empty() ? L"<auto>" : g_jarPath)
         << L", java=" << (g_javaPath.empty() ? L"<auto>" : g_javaPath)
         << L", timeoutMs=" << g_jarTimeoutMs
@@ -454,6 +470,83 @@ static std::wstring ToLowerTrim(const std::wstring& in) {
     s.erase(std::find_if(s.rbegin(), s.rend(), [](wchar_t c){ return !iswspace(c); }).base(), s.end());
     std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c){ return (wchar_t)towlower(c); });
     return s;
+}
+
+static std::vector<RenderBackend> ParseRendererPipeline(const std::wstring& pipelineText) {
+    std::vector<RenderBackend> pipeline;
+    std::wstring text = pipelineText;
+    if (text.empty()) {
+        text = L"java";
+    }
+
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t comma = text.find(L',', start);
+        std::wstring token = (comma == std::wstring::npos)
+            ? text.substr(start)
+            : text.substr(start, comma - start);
+        token = ToLowerTrim(token);
+        if (token == L"java") {
+            pipeline.push_back(RenderBackend::Java);
+        } else if (token == L"web") {
+            pipeline.push_back(RenderBackend::Web);
+        }
+        if (comma == std::wstring::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+
+    if (pipeline.empty()) {
+        pipeline.push_back(RenderBackend::Java);
+    }
+    return pipeline;
+}
+
+static std::wstring JoinRendererPipeline(const std::vector<RenderBackend>& pipeline) {
+    if (pipeline.empty()) {
+        return L"";
+    }
+    std::wstring joined;
+    for (size_t i = 0; i < pipeline.size(); ++i) {
+        if (i > 0) joined += L",";
+        joined += RenderBackendName(pipeline[i]);
+    }
+    return joined;
+}
+
+static std::vector<RenderBackend> GetRendererPipelineVector() {
+    return ParseRendererPipeline(g_rendererPipeline);
+}
+
+static std::wstring HtmlEscape(const std::wstring& text) {
+    std::wstring out = text;
+    ReplaceAll(out, L"&", L"&amp;");
+    ReplaceAll(out, L"<", L"&lt;");
+    ReplaceAll(out, L">", L"&gt;");
+    ReplaceAll(out, L"\"", L"&quot;");
+    ReplaceAll(out, L"'", L"&#39;");
+    return out;
+}
+
+static std::wstring HtmlAttributeEscape(const std::wstring& text) {
+    return HtmlEscape(text);
+}
+
+static std::wstring ExtractFileStem(const std::wstring& path) {
+    if (path.empty()) {
+        return std::wstring();
+    }
+    const wchar_t* fileName = PathFindFileNameW(path.c_str());
+    if (!fileName || !*fileName) {
+        return std::wstring();
+    }
+    std::wstring stem(fileName);
+    size_t dot = stem.find_last_of(L'.');
+    if (dot != std::wstring::npos) {
+        stem.erase(dot);
+    }
+    return stem;
 }
 static bool FindJavaExecutable(std::wstring& outPath) {
     if (!g_javaPath.empty() && FileExistsW(g_javaPath)) { outPath = g_javaPath; return true; }
@@ -489,6 +582,51 @@ static std::string Base64(const std::vector<unsigned char>& in) {
         out.push_back(tbl[(v >> 12) & 63]);
         out.push_back(tbl[(v >> 6) & 63]);
         out.push_back('=');
+    }
+    return out;
+}
+
+static int Base64DecodeChar(wchar_t c) {
+    if (c >= L'A' && c <= L'Z') return int(c - L'A');
+    if (c >= L'a' && c <= L'z') return int(c - L'a') + 26;
+    if (c >= L'0' && c <= L'9') return int(c - L'0') + 52;
+    if (c == L'+') return 62;
+    if (c == L'/') return 63;
+    if (c == L'=') return -1;
+    return -2;
+}
+
+static std::vector<unsigned char> Base64Decode(const std::wstring& in) {
+    std::vector<unsigned char> out;
+    if (in.empty()) {
+        return out;
+    }
+
+    unsigned int buffer = 0;
+    int bitsCollected = 0;
+    for (wchar_t wc : in) {
+        int decoded = Base64DecodeChar(wc);
+        if (decoded < 0) {
+            if (decoded == -1) {
+                if (bitsCollected == 18) {
+                    out.push_back(static_cast<unsigned char>((buffer >> 16) & 0xFF));
+                } else if (bitsCollected == 12) {
+                    out.push_back(static_cast<unsigned char>((buffer >> 16) & 0xFF));
+                    out.push_back(static_cast<unsigned char>((buffer >> 8) & 0xFF));
+                }
+                break;
+            }
+            continue;
+        }
+        buffer = (buffer << 6) | static_cast<unsigned int>(decoded);
+        bitsCollected += 6;
+        if (bitsCollected >= 24) {
+            out.push_back(static_cast<unsigned char>((buffer >> 16) & 0xFF));
+            out.push_back(static_cast<unsigned char>((buffer >> 8) & 0xFF));
+            out.push_back(static_cast<unsigned char>(buffer & 0xFF));
+            buffer = 0;
+            bitsCollected = 0;
+        }
     }
     return out;
 }
@@ -636,10 +774,18 @@ static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
                                     bool preferSvg,
                                     std::wstring& outHtml,
                                     std::wstring* outSvg,
-                                    std::vector<unsigned char>* outPng) {
+                                    std::vector<unsigned char>* outPng,
+                                    std::wstring* outErrorMessage) {
+    auto setError = [&](const std::wstring& message) {
+        if (outErrorMessage) {
+            *outErrorMessage = message;
+        }
+    };
+
     std::wstring svgOut;
     std::vector<unsigned char> pngOut;
     if (!RunPlantUmlJar(umlText, preferSvg, svgOut, pngOut)) {
+        setError(L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.");
         return false;
     }
 
@@ -658,6 +804,7 @@ static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
     if (outPng) {
         *outPng = std::move(pngOut);
     }
+    setError(std::wstring());
     return true;
 }
 
@@ -839,6 +986,575 @@ static std::wstring BuildErrorHtml(const std::wstring& message, bool preferSvg) 
     return BuildShellHtmlWithBody(L"<div class='err'>"+safe+L"</div>", preferSvg);
 }
 
+static bool BuildHtmlFromWebRender(const std::wstring& umlText,
+                                   const std::wstring& sourcePath,
+                                   bool preferSvg,
+                                   std::wstring& outHtml,
+                                   std::wstring* outErrorMessage) {
+    const std::wstring escaped = HtmlEscape(umlText);
+    std::wstring sourceName = ExtractFileStem(sourcePath);
+    if (sourceName.empty()) {
+        sourceName = L"plantuml-diagram";
+    }
+    const std::wstring safeSourceName = HtmlAttributeEscape(sourceName);
+
+    static const wchar_t kWebShellPart1[] = LR"HTML1(<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>PlantUML Viewer</title>
+  <style>
+    :root { color-scheme: light dark; }
+    html, body { height: 100%; }
+    body { margin: 0; background: canvas; color: CanvasText; font: 13px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; position: relative; }
+    #toolbar { position: fixed; top: 8px; left: 8px; display: flex; gap: 6px; z-index: 10; }
+    #toolbar button, #toolbar select { padding: 6px 10px; border-radius: 6px; border: 1px solid color-mix(in oklab, Canvas 70%, CanvasText 30%); background: color-mix(in oklab, Canvas 92%, CanvasText 8%); color: inherit; font: inherit; cursor: pointer; }
+    #toolbar button:hover, #toolbar select:hover { background: color-mix(in oklab, Canvas 88%, CanvasText 12%); }
+    #toolbar button:disabled, #toolbar select:disabled { opacity: 0.6; cursor: not-allowed; }
+    #root { padding: 56px 8px 8px 8px; display: grid; place-items: start center; }
+    #diagram-container { width: min(1100px, 100%); display: grid; gap: 12px; place-items: center; }
+    #diagram-container svg { max-width: 100%; height: auto; }
+    #png-image { display: none; max-width: 100%; height: auto; }
+    .err { padding: 12px 14px; border-radius: 10px; background: color-mix(in oklab, Canvas 85%, red 15%); display: none; text-align: center; }
+    pre.hidden-source { display: none; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/plantuml-encoder@1.2.5/dist/plantuml-encoder.min.js"></script>
+</head>
+<body data-format="{{FORMAT}}" data-source-name="{{SOURCE_NAME}}">
+  <div id="toolbar">
+    <button id="btn-refresh" type="button">Refresh</button>
+    <button id="btn-save" type="button">Save as...</button>
+    <select id="format-select">
+      <option value="svg">SVG</option>
+      <option value="png">PNG</option>
+    </select>
+    <button id="btn-copy" type="button">Copy to clipboard</button>
+  </div>
+  <div id="root">
+    <div id="diagram-container">
+      <div id="svg-container"></div>
+      <img id="png-image" alt="PlantUML Diagram"/>
+      <div id="error-box" class="err"></div>
+    </div>
+  </div>
+  <pre id="plantuml-source" class="hidden-source">{{PLANTUML_SOURCE}}</pre>
+  <script>
+    (function() {
+      const PLANTUML_SERVER_URL = 'https://www.plantuml.com/plantuml';
+
+      const bodyEl = document.body;
+      const sourceEl = document.getElementById('plantuml-source');
+      const svgContainer = document.getElementById('svg-container');
+      const pngImage = document.getElementById('png-image');
+      const errorBox = document.getElementById('error-box');
+      const refreshButton = document.getElementById('btn-refresh');
+      const saveButton = document.getElementById('btn-save');
+      const copyButton = document.getElementById('btn-copy');
+      const formatSelect = document.getElementById('format-select');
+
+      const storageKey = 'plantuml-web-format';
+
+      const state = {
+        svgText: '',
+        pngDataUrl: '',
+        loading: false,
+      };
+
+      let lastSentSvg = '';
+      let lastSentPng = '';
+      let lastSentFormat = '';
+
+      const isConnected = () => !!(window.chrome && window.chrome.webview);
+      const getSource = () => (sourceEl ? sourceEl.textContent : '') || '';
+      const getFormat = () => (bodyEl && bodyEl.dataset && bodyEl.dataset.format) ? bodyEl.dataset.format : 'svg';
+      const setFormat = (value) => {
+        if (bodyEl && bodyEl.dataset) {
+          bodyEl.dataset.format = value;
+        }
+      };
+
+      const setError = (message) => {
+        if (!errorBox) {
+          return;
+        }
+        if (message) {
+          errorBox.textContent = message;
+          errorBox.style.display = 'block';
+        } else {
+          errorBox.textContent = '';
+          errorBox.style.display = 'none';
+        }
+      };
+
+      const clearDiagram = () => {
+        if (svgContainer) {
+          svgContainer.innerHTML = '';
+        }
+        if (pngImage) {
+          pngImage.removeAttribute('src');
+          pngImage.style.display = 'none';
+        }
+      };
+
+      const hasRenderable = () => {
+        if (state.loading) {
+          return false;
+        }
+        if (getFormat() === 'png') {
+          return !!state.pngDataUrl;
+        }
+        return !!state.svgText;
+      };
+
+      const encodeBase64 = (text) => {
+        try {
+          if (typeof TextEncoder !== 'undefined') {
+            const bytes = new TextEncoder().encode(text);
+            let binary = '';
+            bytes.forEach((b) => { binary += String.fromCharCode(b); });
+            return window.btoa(binary);
+          }
+          return window.btoa(unescape(encodeURIComponent(text)));
+        } catch (err) {
+          console.warn('Unable to encode payload as base64', err);
+          return '';
+        }
+      };
+
+      const extractBase64FromDataUrl = (dataUrl) => {
+        if (!dataUrl) {
+          return '';
+        }
+        const comma = dataUrl.indexOf(',');
+        return comma >= 0 ? dataUrl.slice(comma + 1) : '';
+      };
+
+      const notifyHost = () => {
+        if (!isConnected()) {
+          return;
+        }
+        const format = getFormat();
+        const svgBase64 = state.svgText ? encodeBase64(state.svgText) : '';
+        const pngBase64 = state.pngDataUrl ? extractBase64FromDataUrl(state.pngDataUrl) : '';
+        if (svgBase64 === lastSentSvg && pngBase64 === lastSentPng && format === lastSentFormat) {
+          return;
+        }
+        lastSentSvg = svgBase64;
+        lastSentPng = pngBase64;
+        lastSentFormat = format;
+        try {
+          window.chrome.webview.postMessage({
+            type: 'rendered',
+            format,
+            svgBase64,
+            pngBase64,
+          });
+        } catch (err) {
+          console.warn('Failed to notify host about rendered diagram', err);
+        }
+      };
+)HTML1";
+
+    static const wchar_t kWebShellPart2[] = LR"HTML2(
+      const updateSaveState = () => {
+        if (!saveButton) {
+          return;
+        }
+        if (hasRenderable()) {
+          saveButton.disabled = false;
+          saveButton.removeAttribute('title');
+        } else if (state.loading) {
+          saveButton.disabled = true;
+          saveButton.title = 'Rendering diagram...';
+        } else {
+          saveButton.disabled = true;
+          saveButton.title = 'Diagram not rendered yet';
+        }
+      };
+
+      const updateCopyState = () => {
+        if (!copyButton) {
+          return;
+        }
+        const connected = isConnected();
+        const clipboardItemAvailable = typeof window.ClipboardItem !== 'undefined';
+        const webApiAvailable = !!navigator.clipboard && (getFormat() !== 'png' || clipboardItemAvailable);
+        if (connected) {
+          copyButton.disabled = false;
+          copyButton.removeAttribute('title');
+        } else if (webApiAvailable && hasRenderable()) {
+          copyButton.disabled = false;
+          copyButton.title = 'Host unavailable – using browser clipboard';
+        } else if (!webApiAvailable) {
+          copyButton.disabled = true;
+          copyButton.title = getFormat() === 'png' && !clipboardItemAvailable
+            ? 'Clipboard image support is unavailable'
+            : 'Clipboard access is unavailable';
+        } else {
+          copyButton.disabled = true;
+          copyButton.title = 'Diagram not rendered yet';
+        }
+      };
+
+      const updateRefreshState = () => {
+        if (!refreshButton) {
+          return;
+        }
+        const connected = isConnected();
+        refreshButton.disabled = !connected;
+        if (!connected) {
+          refreshButton.title = 'Available inside Total Commander';
+          window.setTimeout(updateRefreshState, 1000);
+        } else {
+          refreshButton.removeAttribute('title');
+        }
+      };
+
+      const dataUrlToBlob = async (dataUrl) => {
+        try {
+          const res = await fetch(dataUrl);
+          return await res.blob();
+        } catch (err) {
+          console.warn('Failed to convert data URL to blob', err);
+          return null;
+        }
+      };
+
+      const saveWithWebApi = () => {
+        if (!hasRenderable()) {
+          return;
+        }
+        const format = getFormat();
+        const fileBase = (bodyEl && bodyEl.dataset && bodyEl.dataset.sourceName) ? bodyEl.dataset.sourceName : 'plantuml-diagram';
+        const filename = (fileBase || 'plantuml-diagram') + '.' + (format === 'png' ? 'png' : 'svg');
+        if (format === 'png' && state.pngDataUrl) {
+          const link = document.createElement('a');
+          link.href = state.pngDataUrl;
+          link.download = filename;
+          link.click();
+        } else if (state.svgText) {
+          const blob = new Blob([state.svgText], { type: 'image/svg+xml;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          link.download = filename;
+          link.click();
+          window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+      };
+
+      const copyWithWebApi = async () => {
+        if (!navigator.clipboard || !hasRenderable()) {
+          return false;
+        }
+        const format = getFormat();
+        try {
+          if (format === 'png' && state.pngDataUrl) {
+            if (typeof window.ClipboardItem === 'undefined') {
+              return false;
+            }
+            const blob = await dataUrlToBlob(state.pngDataUrl);
+            if (!blob) {
+              return false;
+            }
+            await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+            return true;
+          }
+          if (state.svgText) {
+            await navigator.clipboard.writeText(state.svgText);
+            return true;
+          }
+        } catch (err) {
+          console.warn('Failed to copy diagram to clipboard', err);
+        }
+        return false;
+      };
+
+      const requestFallback = (message) => {
+        if (!isConnected()) {
+          return;
+        }
+        try {
+          window.chrome.webview.postMessage({ type: 'renderFailed', message });
+        } catch (err) {
+          console.warn('Failed to notify host about render failure', err);
+        }
+      };
+)HTML2";
+
+    static const wchar_t kWebShellPart3[] = LR"HTML3(
+      const renderDiagram = async () => {
+        const format = getFormat();
+        const source = getSource();
+        if (!plantumlEncoder || typeof plantumlEncoder.encode !== 'function') {
+          const message = 'PlantUML encoder library not available.';
+          state.svgText = '';
+          state.pngDataUrl = '';
+          state.loading = false;
+          clearDiagram();
+          setError(message);
+          notifyHost();
+          requestFallback(message);
+          updateSaveState();
+          updateCopyState();
+          return;
+        }
+        if (!source.trim()) {
+          clearDiagram();
+          state.svgText = '';
+          state.pngDataUrl = '';
+          state.loading = false;
+          setError('PlantUML source is empty.');
+          notifyHost();
+          updateSaveState();
+          updateCopyState();
+          return;
+        }
+        state.loading = true;
+        setError('');
+        updateSaveState();
+        updateCopyState();
+        clearDiagram();
+        const encoded = plantumlEncoder.encode(source);
+        const imageURL = PLANTUML_SERVER_URL + '/' + format + '/' + encoded;
+        try {
+          if (format === 'png') {
+            const response = await fetch(imageURL, { cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error('HTTP ' + response.status);
+            }
+            const blob = await response.blob();
+            const reader = new FileReader();
+            const dataUrl = await new Promise((resolve, reject) => {
+              reader.onload = () => resolve(reader.result || '');
+              reader.onerror = () => reject(new Error('Failed to decode PNG response'));
+              reader.readAsDataURL(blob);
+            });
+            state.svgText = '';
+            state.pngDataUrl = typeof dataUrl === 'string' ? dataUrl : '';
+            if (pngImage) {
+              if (state.pngDataUrl) {
+                pngImage.src = state.pngDataUrl;
+                pngImage.style.display = 'block';
+              } else {
+                pngImage.removeAttribute('src');
+                pngImage.style.display = 'none';
+              }
+            }
+            if (svgContainer) {
+              svgContainer.innerHTML = '';
+            }
+          } else {
+            const response = await fetch(imageURL, { cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error('HTTP ' + response.status);
+            }
+            const svgText = await response.text();
+            state.svgText = svgText;
+            state.pngDataUrl = '';
+            if (svgContainer) {
+              svgContainer.innerHTML = svgText;
+            }
+            if (pngImage) {
+              pngImage.removeAttribute('src');
+              pngImage.style.display = 'none';
+            }
+          }
+          setError('');
+          notifyHost();
+        } catch (err) {
+          console.error('Failed to fetch PlantUML diagram', err);
+          const message = 'Unable to load diagram from PlantUML server.';
+          state.svgText = '';
+          state.pngDataUrl = '';
+          clearDiagram();
+          setError(message);
+          notifyHost();
+          requestFallback(message);
+        } finally {
+          state.loading = false;
+          updateSaveState();
+          updateCopyState();
+        }
+      };
+)HTML3";
+
+    static const wchar_t kWebShellPart4[] = LR"HTML4(
+      if (formatSelect) {
+        const stored = (() => {
+          try {
+            return window.localStorage ? window.localStorage.getItem(storageKey) : null;
+          } catch (err) {
+            return null;
+          }
+        })();
+        const initial = (stored === 'png' || stored === 'svg') ? stored : getFormat();
+        setFormat(initial);
+        formatSelect.value = initial;
+        formatSelect.addEventListener('change', () => {
+          const value = formatSelect.value === 'png' ? 'png' : 'svg';
+          setFormat(value);
+          try {
+            if (window.localStorage) {
+              window.localStorage.setItem(storageKey, value);
+            }
+          } catch (err) {}
+          state.svgText = '';
+          state.pngDataUrl = '';
+          notifyHost();
+          renderDiagram();
+          updateSaveState();
+          updateCopyState();
+          if (isConnected()) {
+            try {
+              window.chrome.webview.postMessage({ type: 'setFormat', format: value });
+            } catch (err) {
+              console.warn('Failed to notify host about format change', err);
+            }
+          }
+        });
+      } else {
+        setFormat(getFormat());
+      }
+
+      if (refreshButton) {
+        refreshButton.addEventListener('click', () => {
+          if (isConnected()) {
+            window.chrome.webview.postMessage({ type: 'refresh' });
+          } else {
+            renderDiagram();
+          }
+        });
+      }
+
+      if (saveButton) {
+        saveButton.addEventListener('click', () => {
+          if (isConnected()) {
+            window.chrome.webview.postMessage({ type: 'saveAs' });
+          } else {
+            saveWithWebApi();
+          }
+        });
+      }
+
+      if (copyButton) {
+        copyButton.addEventListener('click', async () => {
+          if (isConnected()) {
+            window.chrome.webview.postMessage({ type: 'copy' });
+          } else {
+            await copyWithWebApi();
+          }
+        });
+      }
+
+      document.addEventListener('keydown', async (ev) => {
+        if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'c') {
+          ev.preventDefault();
+          if (isConnected()) {
+            window.chrome.webview.postMessage({ type: 'copy' });
+          } else {
+            await copyWithWebApi();
+          }
+        }
+      });
+
+      updateRefreshState();
+      updateSaveState();
+      updateCopyState();
+      renderDiagram();
+    })();
+  </script>
+</body>
+</html>
+)HTML4";
+
+    std::wstring html(kWebShellPart1);
+    html.append(kWebShellPart2);
+    html.append(kWebShellPart3);
+    html.append(kWebShellPart4);
+
+    ReplaceAll(html, L"{{FORMAT}}", preferSvg ? L"svg" : L"png");
+    ReplaceAll(html, L"{{SOURCE_NAME}}", safeSourceName);
+    ReplaceAll(html, L"{{PLANTUML_SOURCE}}", escaped);
+
+    outHtml.swap(html);
+    if (outErrorMessage) {
+        *outErrorMessage = std::wstring();
+    }
+    return true;
+}
+
+struct RenderPipelineResult {
+    bool success = false;
+    RenderBackend backend = RenderBackend::Java;
+    size_t backendIndex = 0;
+    std::wstring html;
+    std::wstring svg;
+    std::vector<unsigned char> png;
+    std::wstring errorMessage;
+};
+
+static RenderPipelineResult ExecuteRenderPipeline(const std::vector<RenderBackend>& pipeline,
+                                                  size_t startIndex,
+                                                  const std::wstring& text,
+                                                  const std::wstring& sourcePath,
+                                                  bool preferSvg,
+                                                  std::wstring& firstErrorMessage) {
+    RenderPipelineResult result;
+    if (pipeline.empty()) {
+        std::vector<RenderBackend> defaultPipeline = { RenderBackend::Java };
+        return ExecuteRenderPipeline(defaultPipeline, 0, text, sourcePath, preferSvg, firstErrorMessage);
+    }
+
+    for (size_t idx = startIndex; idx < pipeline.size(); ++idx) {
+        const RenderBackend backend = pipeline[idx];
+        if (backend == RenderBackend::Java) {
+            std::wstring html;
+            std::wstring svg;
+            std::vector<unsigned char> png;
+            std::wstring error;
+            if (BuildHtmlFromJavaRender(text, preferSvg, html, &svg, &png, &error)) {
+                result.success = true;
+                result.backend = backend;
+                result.backendIndex = idx;
+                result.html = std::move(html);
+                result.svg = std::move(svg);
+                result.png = std::move(png);
+                return result;
+            }
+            if (firstErrorMessage.empty()) {
+                firstErrorMessage = !error.empty() ? error : std::wstring(L"Local Java rendering failed.");
+            }
+        } else if (backend == RenderBackend::Web) {
+            std::wstring html;
+            std::wstring error;
+            if (BuildHtmlFromWebRender(text, sourcePath, preferSvg, html, &error)) {
+                result.success = true;
+                result.backend = backend;
+                result.backendIndex = idx;
+                result.html = std::move(html);
+                if (firstErrorMessage.empty() && !error.empty()) {
+                    firstErrorMessage = error;
+                }
+                return result;
+            }
+            if (firstErrorMessage.empty()) {
+                firstErrorMessage = !error.empty() ? error : std::wstring(L"PlantUML web rendering failed.");
+            }
+        }
+    }
+
+    result.success = false;
+    result.backendIndex = std::min(startIndex, pipeline.size() - 1);
+    result.backend = pipeline[result.backendIndex];
+    result.errorMessage = firstErrorMessage.empty()
+        ? std::wstring(L"Unable to render the diagram. Check the log for details.")
+        : firstErrorMessage;
+    return result;
+}
+
 // ---------------------- WebView host ----------------------
 static const wchar_t* kWndClass = L"PumlWebViewHost";
 
@@ -866,6 +1582,10 @@ struct Host {
     std::vector<unsigned char> lastPng;
     bool lastPreferSvg = true;
     bool hasRender = false;
+    std::vector<RenderBackend> pipeline;
+    size_t activeRendererIndex = 0;
+    RenderBackend activeRenderer = RenderBackend::Java;
+    std::wstring firstErrorMessage;
 };
 
 static void HostNavigateToInitialHtml(Host* host) {
@@ -896,15 +1616,29 @@ static bool HostRenderAndReload(Host* host,
                                 bool preferSvg,
                                 const std::wstring& logContext,
                                 const std::wstring& failureDialogMessage,
-                                bool showDialogOnFailure) {
+                                bool showDialogOnFailure,
+                                size_t startIndex = 0,
+                                const std::wstring& preservedErrorMessage = std::wstring()) {
     if (!host) {
         return false;
     }
 
     std::wstring sourcePath;
+    std::vector<RenderBackend> pipeline;
     {
         std::lock_guard<std::mutex> lock(host->stateMutex);
         sourcePath = host->sourceFilePath;
+        pipeline = host->pipeline;
+    }
+
+    if (pipeline.empty()) {
+        pipeline = GetRendererPipelineVector();
+    }
+    if (pipeline.empty()) {
+        pipeline.push_back(RenderBackend::Java);
+    }
+    if (startIndex >= pipeline.size()) {
+        startIndex = pipeline.size() - 1;
     }
 
     if (sourcePath.empty()) {
@@ -926,34 +1660,64 @@ static bool HostRenderAndReload(Host* host,
     const std::wstring text = ReadFileUtf16OrAnsi(sourcePath.c_str());
     AppendLog(logContext + L": file characters=" + std::to_wstring(text.size()));
 
-    std::wstring html;
-    std::wstring svg;
-    std::vector<unsigned char> png;
+    std::wstring firstError = preservedErrorMessage;
+    RenderPipelineResult renderResult = ExecuteRenderPipeline(pipeline,
+                                                              startIndex,
+                                                              text,
+                                                              sourcePath,
+                                                              preferSvg,
+                                                              firstError);
+
     std::wstring htmlToNavigate;
 
-    if (BuildHtmlFromJavaRender(text, preferSvg, html, &svg, &png)) {
-        AppendLog(logContext + L": render succeeded");
+    if (renderResult.success) {
+        std::wstringstream os;
+        os << logContext << L": render succeeded via " << RenderBackendName(renderResult.backend)
+           << L" (index=" << static_cast<unsigned long long>(renderResult.backendIndex) << L")";
+        AppendLog(os.str());
         {
             std::lock_guard<std::mutex> lock(host->stateMutex);
-            host->initialHtml = html;
-            host->lastSvg = std::move(svg);
-            host->lastPng = std::move(png);
+            host->pipeline = pipeline;
+            host->initialHtml = renderResult.html;
             host->lastPreferSvg = preferSvg;
-            host->hasRender = true;
+            host->activeRenderer = renderResult.backend;
+            host->activeRendererIndex = renderResult.backendIndex;
+            if (renderResult.backend == RenderBackend::Java) {
+                host->firstErrorMessage.clear();
+                host->lastSvg = renderResult.svg;
+                host->lastPng = renderResult.png;
+                host->hasRender = preferSvg ? !host->lastSvg.empty() : !host->lastPng.empty();
+            } else {
+                if (firstError.empty()) {
+                    host->firstErrorMessage.clear();
+                } else {
+                    host->firstErrorMessage = firstError;
+                }
+                host->lastSvg.clear();
+                host->lastPng.clear();
+                host->hasRender = false;
+            }
             htmlToNavigate = host->initialHtml;
         }
     } else {
-        AppendLog(logContext + L": render failed");
-        const std::wstring dialogMessage = failureDialogMessage.empty()
+        std::wstring dialogMessage = failureDialogMessage.empty()
             ? std::wstring(L"Unable to render the diagram. Check the log for details.")
             : failureDialogMessage;
+        if (!firstError.empty()) {
+            dialogMessage = firstError;
+        }
+        AppendLog(logContext + L": render failed -> " + dialogMessage);
         {
             std::lock_guard<std::mutex> lock(host->stateMutex);
+            host->pipeline = pipeline;
             host->initialHtml = BuildErrorHtml(dialogMessage, preferSvg);
             host->lastSvg.clear();
             host->lastPng.clear();
             host->lastPreferSvg = preferSvg;
             host->hasRender = false;
+            host->activeRendererIndex = std::min(startIndex, pipeline.size() - 1);
+            host->activeRenderer = pipeline[host->activeRendererIndex];
+            host->firstErrorMessage = firstError.empty() ? dialogMessage : firstError;
             htmlToNavigate = host->initialHtml;
         }
         if (showDialogOnFailure && host->hwnd) {
@@ -1074,6 +1838,21 @@ static void HostHandleRefresh(Host* host) {
 static void HostHandleFormatChange(Host* host, bool preferSvg) {
     if (!host) return;
 
+    RenderBackend backend = RenderBackend::Java;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        backend = host->activeRenderer;
+        host->lastPreferSvg = preferSvg;
+        if (backend == RenderBackend::Web) {
+            host->hasRender = false;
+        }
+    }
+
+    if (backend == RenderBackend::Web) {
+        AppendLog(L"HostHandleFormatChange: updated preferred format to " + std::wstring(preferSvg ? L"SVG" : L"PNG") + L" (web renderer)");
+        return;
+    }
+
     const std::wstring formatLabel = preferSvg ? L"svg" : L"png";
     const std::wstring logContext = std::wstring(L"HostHandleFormatChange(") + formatLabel + L")";
     const std::wstring errorMessage = preferSvg
@@ -1085,6 +1864,116 @@ static void HostHandleFormatChange(Host* host, bool preferSvg) {
                         logContext,
                         errorMessage,
                         true);
+}
+
+static void HostHandleRenderUpdate(Host* host,
+                                   const std::wstring& format,
+                                   const std::wstring& svgBase64,
+                                   const std::wstring& pngBase64) {
+    if (!host) {
+        return;
+    }
+
+    std::vector<unsigned char> svgBytes = Base64Decode(svgBase64);
+    const size_t svgByteCount = svgBytes.size();
+    std::wstring svgText;
+    if (!svgBytes.empty()) {
+        std::string utf8(svgBytes.begin(), svgBytes.end());
+        svgText = FromUtf8(utf8);
+    }
+
+    std::vector<unsigned char> pngBytes = Base64Decode(pngBase64);
+    const size_t pngByteCount = pngBytes.size();
+
+    const std::wstring loweredFormat = ToLowerTrim(format);
+    const bool preferSvg = loweredFormat.empty() ? true : (loweredFormat != L"png");
+    const bool hasRenderable = !svgText.empty() || !pngBytes.empty();
+
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        host->lastSvg = std::move(svgText);
+        host->lastPng = std::move(pngBytes);
+        host->lastPreferSvg = preferSvg;
+        host->hasRender = hasRenderable;
+        if (hasRenderable) {
+            host->firstErrorMessage.clear();
+        }
+    }
+
+    std::wstringstream log;
+    log << L"HostHandleRenderUpdate: received render payload (svgBytes="
+        << static_cast<unsigned long long>(svgByteCount)
+        << L", pngBytes=" << static_cast<unsigned long long>(pngByteCount)
+        << L", preferSvg=" << (preferSvg ? L"true" : L"false") << L")";
+    AppendLog(log.str());
+}
+
+static void HostHandleRenderFailure(Host* host, const std::wstring& message) {
+    if (!host) {
+        return;
+    }
+
+    std::vector<RenderBackend> pipeline;
+    size_t nextIndex = 0;
+    bool preferSvg = true;
+    std::wstring preservedError;
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        pipeline = host->pipeline;
+        nextIndex = host->activeRendererIndex + 1;
+        preferSvg = host->lastPreferSvg;
+        if (host->firstErrorMessage.empty() && !message.empty()) {
+            host->firstErrorMessage = message;
+        }
+        preservedError = host->firstErrorMessage;
+    }
+
+    if (pipeline.empty()) {
+        pipeline = GetRendererPipelineVector();
+    }
+
+    std::wstringstream log;
+    log << L"HostHandleRenderFailure: message='" << message
+        << L"', nextIndex=" << static_cast<unsigned long long>(nextIndex)
+        << L"/" << static_cast<unsigned long long>(pipeline.size());
+    AppendLog(log.str());
+
+    if (!pipeline.empty() && nextIndex < pipeline.size()) {
+        const RenderBackend nextBackend = pipeline[nextIndex];
+        AppendLog(L"HostHandleRenderFailure: attempting fallback to " + std::wstring(RenderBackendName(nextBackend)));
+        const std::wstring dialogMessage = preservedError.empty() ? message : preservedError;
+        HostRenderAndReload(host,
+                            preferSvg,
+                            L"HostHandleRenderFailure",
+                            dialogMessage,
+                            false,
+                            nextIndex,
+                            preservedError);
+        return;
+    }
+
+    std::wstring finalMessage = preservedError.empty() ? message : preservedError;
+    if (finalMessage.empty()) {
+        finalMessage = L"Unable to render the diagram. Check the log for details.";
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        host->initialHtml = BuildErrorHtml(finalMessage, host->lastPreferSvg);
+        host->lastSvg.clear();
+        host->lastPng.clear();
+        host->hasRender = false;
+        host->firstErrorMessage = finalMessage;
+        if (!pipeline.empty()) {
+            size_t index = nextIndex == 0 ? 0 : std::min(nextIndex - 1, pipeline.size() - 1);
+            host->activeRendererIndex = index;
+            host->activeRenderer = pipeline[index];
+        }
+    }
+
+    if (host->web && !host->initialHtml.empty()) {
+        host->web->NavigateToString(host->initialHtml.c_str());
+    }
 }
 
 static void HostHandleCopy(Host* host) {
@@ -1330,6 +2219,14 @@ static void InitWebView(struct Host* host){
                                     HostHandleFormatChange(host, preferSvg);
                                 } else if (type == L"copy") {
                                     HostHandleCopy(host);
+                                } else if (type == L"rendered") {
+                                    std::wstring format = ExtractJsonStringField(json, L"format");
+                                    std::wstring svgB64 = ExtractJsonStringField(json, L"svgBase64");
+                                    std::wstring pngB64 = ExtractJsonStringField(json, L"pngBase64");
+                                    HostHandleRenderUpdate(host, format, svgB64, pngB64);
+                                } else if (type == L"renderfailed") {
+                                    std::wstring message = ExtractJsonStringField(json, L"message");
+                                    HostHandleRenderFailure(host, message);
                                 }
                             } else if (rawJson) {
                                 CoTaskMemFree(rawJson);
@@ -1429,37 +2326,31 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
     }
     SetWindowLongPtrW(host->hwnd, GWLP_USERDATA, (LONG_PTR)host);
 
-    const std::wstring text = ReadFileUtf16OrAnsi(FileToLoad);
-    AppendLog(L"ListLoadW: loaded file characters=" + std::to_wstring(text.size()));
     const bool preferSvg = (ToLowerTrim(g_prefer) == L"svg");
     AppendLog(L"ListLoadW: preferSvg=" + std::wstring(preferSvg ? L"true" : L"false"));
 
-    AppendLog(L"ListLoadW: attempting local Java render with jar=" + (g_jarPath.empty() ? std::wstring(L"<auto>") : g_jarPath));
-    std::wstring html;
-    if (BuildHtmlFromJavaRender(text, preferSvg, html, &host->lastSvg, &host->lastPng)) {
-        {
-            std::lock_guard<std::mutex> lock(host->stateMutex);
-            host->initialHtml = html;
-            host->sourceFilePath = FileToLoad ? std::wstring(FileToLoad) : std::wstring();
-            host->lastPreferSvg = preferSvg;
-            host->hasRender = true;
-        }
-        AppendLog(L"ListLoadW: local render succeeded" + std::wstring(preferSvg ? L" (SVG)" : L" (PNG)"));
-    } else {
-        const std::wstring lastErr = L"Local Java/JAR rendering failed. Check Java installation and plantuml.jar path in the INI file.";
-        {
-            std::lock_guard<std::mutex> lock(host->stateMutex);
-            host->initialHtml = BuildErrorHtml(lastErr, preferSvg);
-            host->sourceFilePath = FileToLoad ? std::wstring(FileToLoad) : std::wstring();
-            host->lastPreferSvg = preferSvg;
-            host->lastSvg.clear();
-            host->lastPng.clear();
-            host->hasRender = false;
-        }
-        AppendLog(L"ListLoadW: java error message -> " + lastErr);
-        AppendLog(L"ListLoadW: local render failed");
-        AppendLog(L"ListLoadW: showing error HTML");
+    std::vector<RenderBackend> pipeline = GetRendererPipelineVector();
+    AppendLog(L"ListLoadW: renderer pipeline = " + JoinRendererPipeline(pipeline));
+
+    {
+        std::lock_guard<std::mutex> lock(host->stateMutex);
+        host->sourceFilePath = FileToLoad ? std::wstring(FileToLoad) : std::wstring();
+        host->pipeline = pipeline;
+        host->activeRendererIndex = 0;
+        host->activeRenderer = pipeline.empty() ? RenderBackend::Java : pipeline.front();
+        host->lastPreferSvg = preferSvg;
+        host->firstErrorMessage.clear();
+        host->lastSvg.clear();
+        host->lastPng.clear();
+        host->hasRender = false;
     }
+
+    const std::wstring failureMessage = L"Unable to render the diagram. Check the log for details.";
+    HostRenderAndReload(host,
+                        preferSvg,
+                        L"ListLoadW",
+                        failureMessage,
+                        false);
 
     InitWebView(host);
     AppendLog(L"ListLoadW: InitWebView invoked");
