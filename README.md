@@ -21,7 +21,7 @@ Powered by **WebView2** — no Qt or zlib required.
 * **Microsoft Edge WebView2 Runtime** (evergreen).
   👉 Download from Microsoft: <https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download>
 * Internet connection OR **Java** (`javaw.exe`/`java.exe`) and **`plantuml.jar`** (shipped with releases).
- * You can change the renderer settings from "java" to "web" and it will send your diagram to the official PlantUML web server for rendering so you don't need Java. You can even delete the jar to reduce the plugin from 15.4 MB to 394 KB. AFAIK they don't store the diagrams.
+  * You can change the renderer settings from "java" to "web" and it will send your diagram to the official PlantUML web server for rendering so you don't need Java. You can even delete the jar to reduce the plugin from 15.4 MB to 394 KB. AFAIK they don't store the diagrams.
 
 ---
 
