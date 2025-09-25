@@ -58,6 +58,11 @@ static const wchar_t* RenderBackendName(RenderBackend backend) {
     return L"unknown";
 }
 
+static RenderBackend ParseRendererSettingValue(const std::wstring& rendererText,
+                                              RenderBackend fallback);
+static RenderBackend GetConfiguredRenderer();
+static std::wstring GetConfiguredRendererName();
+
 static std::string ToUtf8(const std::wstring& w);
 
 static std::wstring FormatTimestamp() {
