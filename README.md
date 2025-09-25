@@ -20,7 +20,8 @@ Powered by **WebView2** — no Qt or zlib required.
 * **Total Commander 64-bit** (Lister/WLX plugin support).
 * **Microsoft Edge WebView2 Runtime** (evergreen).
   👉 Download from Microsoft: <https://developer.microsoft.com/en-us/microsoft-edge/webview2/#download>
-* **Java** (`javaw.exe`/`java.exe`) and **`plantuml.jar`** (shipped with releases).
+* Internet connection OR **Java** (`javaw.exe`/`java.exe`) and **`plantuml.jar`** (shipped with releases).
+ * You can change the renderer settings from "java" to "web" and it will send your diagram to the official PlantUML web server for rendering so you don't need Java. You can even delete the jar to reduce the plugin from 15.4 MB to 394 KB. AFAIK they don't store the diagrams.
 
 ---
 
@@ -93,7 +94,8 @@ Set `[render] renderer=java` (default) to render locally via Java and `plantuml.
 
 ## Data handling
 
-All rendering happens locally via Java and `plantuml.jar`; the plugin does not perform any network requests.
+renderer=java: All rendering happens locally via Java and `plantuml.jar`; the plugin does not perform any network requests.
+renderer=web: The plugin sends your diagram to [https://www.plantuml.com/plantuml](https://www.plantuml.com/plantuml) for rendering. AFAIK, the diagram is not stored anywhere.
 
 ---
 
