@@ -806,7 +806,6 @@ static const std::wstring& PlantumlEncoderScript() {
     return script;
 }
 
-
 static std::wstring BuildShellHtmlWithBody(const std::wstring& body, bool preferSvg);
 
 static bool BuildHtmlFromJavaRender(const std::wstring& umlText,
