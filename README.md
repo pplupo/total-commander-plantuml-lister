@@ -10,7 +10,7 @@ Powered by **WebView2** — no Qt or zlib required.
 
 * 🪶 **Small footprint** – just a WLX DLL, a config INI, and `WebView2Loader.dll`.
 * ⚡ **Fast preview** – render via local Java + `plantuml.jar`.
-* 🔧 **Configurable** – choose **SVG** or **PNG**, and configure Java/JAR paths.
+* 🔧 **Configurable** – choose **SVG** or **PNG**, pick the local Java or web renderer, and configure Java/JAR paths.
 * 📋 **Copy to clipboard** – **Ctrl+C** copies **SVG text** or a **PNG bitmap** from Lister.
 
 ---
@@ -57,6 +57,8 @@ Default contents:
 [render]
 ; "svg" (default) or "png"
 prefer=svg
+; Renderer: "java" (default) or "web"
+renderer=java
 
 [plantuml]
 ; If empty, the plugin auto-tries "plantuml.jar" next to PlantUmlWebView.wlx64.
@@ -79,6 +81,8 @@ string=EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUM
 log_enabled=1
 log=
 ```
+
+Set `[render] renderer=java` (default) to render locally via Java and `plantuml.jar`, or `[render] renderer=web` to use the PlantUML web service. Rendering backends are now mutually exclusive—pick the one you prefer.
 
 ### SVG vs PNG
 
