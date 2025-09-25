@@ -94,8 +94,8 @@ Set `[render] renderer=java` (default) to render locally via Java and `plantuml.
 
 ## Data handling
 
-renderer=java: All rendering happens locally via Java and `plantuml.jar`; the plugin does not perform any network requests.
-renderer=web: The plugin sends your diagram to [https://www.plantuml.com/plantuml](https://www.plantuml.com/plantuml) for rendering. AFAIK, the diagram is not stored anywhere.
+* renderer=java: All rendering happens locally via Java and `plantuml.jar`; the plugin does not perform any network requests.
+* renderer=web: The plugin sends your diagram to [https://www.plantuml.com/plantuml](https://www.plantuml.com/plantuml) for rendering. AFAIK, the diagram is not stored anywhere.
 
 ---
 
