@@ -31,7 +31,7 @@ using namespace Microsoft::WRL;
 
 // ---------------------- Config ----------------------
 static std::wstring g_prefer          = L"svg";           // "svg" or "png"
-static std::wstring g_rendererPipeline = L"web,java";        // e.g. "java", "web", "web,java"
+static std::wstring g_rendererSetting = L"java";          // "java" or "web"
 static std::string  g_detectA         = R"(EXT="PUML" | EXT="PLANTUML" | EXT="UML" | EXT="WSD" | EXT="WS" | EXT="IUML")";
 
 static std::wstring g_jarPath;                      // If empty: auto-detect moduleDir\plantuml.jar
@@ -399,7 +399,14 @@ static void LoadConfigIfNeeded() {
     wchar_t buf[2048];
 
     if (GetPrivateProfileStringW(L"render", L"prefer", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_prefer = buf;
-    if (GetPrivateProfileStringW(L"render", L"pipeline", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) g_rendererPipeline = buf;
+
+    RenderBackend rendererChoice = GetConfiguredRenderer();
+    if (GetPrivateProfileStringW(L"render", L"renderer", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
+        rendererChoice = ParseRendererSettingValue(buf, rendererChoice);
+    } else if (GetPrivateProfileStringW(L"render", L"pipeline", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
+        rendererChoice = ParseRendererSettingValue(buf, rendererChoice);
+    }
+    g_rendererSetting = RenderBackendName(rendererChoice);
 
     if (GetPrivateProfileStringW(L"detect", L"string", L"", buf, 2048, ini.c_str()) > 0 && buf[0]) {
         int need = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
@@ -455,7 +462,7 @@ static void LoadConfigIfNeeded() {
 
     std::wstringstream cfg;
     cfg << L"Config loaded. prefer=" << g_prefer
-        << L", pipeline=" << g_rendererPipeline
+        << L", renderer=" << GetConfiguredRendererName()
         << L", jar=" << (g_jarPath.empty() ? L"<auto>" : g_jarPath)
         << L", java=" << (g_javaPath.empty() ? L"<auto>" : g_javaPath)
         << L", timeoutMs=" << g_jarTimeoutMs
@@ -472,51 +479,33 @@ static std::wstring ToLowerTrim(const std::wstring& in) {
     return s;
 }
 
-static std::vector<RenderBackend> ParseRendererPipeline(const std::wstring& pipelineText) {
-    std::vector<RenderBackend> pipeline;
-    std::wstring text = pipelineText;
-    if (text.empty()) {
-        text = L"java";
+static RenderBackend ParseRendererSettingValue(const std::wstring& rendererText,
+                                              RenderBackend fallback) {
+    std::wstring token = ToLowerTrim(rendererText);
+    if (token.empty()) {
+        return fallback;
     }
 
-    size_t start = 0;
-    while (start <= text.size()) {
-        size_t comma = text.find(L',', start);
-        std::wstring token = (comma == std::wstring::npos)
-            ? text.substr(start)
-            : text.substr(start, comma - start);
-        token = ToLowerTrim(token);
-        if (token == L"java") {
-            pipeline.push_back(RenderBackend::Java);
-        } else if (token == L"web") {
-            pipeline.push_back(RenderBackend::Web);
-        }
-        if (comma == std::wstring::npos) {
-            break;
-        }
-        start = comma + 1;
+    size_t comma = token.find(L',');
+    if (comma != std::wstring::npos) {
+        token = ToLowerTrim(token.substr(0, comma));
     }
 
-    if (pipeline.empty()) {
-        pipeline.push_back(RenderBackend::Java);
+    if (token == L"web") {
+        return RenderBackend::Web;
     }
-    return pipeline;
+    if (token == L"java") {
+        return RenderBackend::Java;
+    }
+    return fallback;
 }
 
-static std::wstring JoinRendererPipeline(const std::vector<RenderBackend>& pipeline) {
-    if (pipeline.empty()) {
-        return L"";
-    }
-    std::wstring joined;
-    for (size_t i = 0; i < pipeline.size(); ++i) {
-        if (i > 0) joined += L",";
-        joined += RenderBackendName(pipeline[i]);
-    }
-    return joined;
+static RenderBackend GetConfiguredRenderer() {
+    return ParseRendererSettingValue(g_rendererSetting, RenderBackend::Java);
 }
 
-static std::vector<RenderBackend> GetRendererPipelineVector() {
-    return ParseRendererPipeline(g_rendererPipeline);
+static std::wstring GetConfiguredRendererName() {
+    return std::wstring(RenderBackendName(GetConfiguredRenderer()));
 }
 
 static std::wstring HtmlEscape(const std::wstring& text) {
@@ -1533,69 +1522,51 @@ static bool BuildHtmlFromWebRender(const std::wstring& umlText,
 struct RenderPipelineResult {
     bool success = false;
     RenderBackend backend = RenderBackend::Java;
-    size_t backendIndex = 0;
     std::wstring html;
     std::wstring svg;
     std::vector<unsigned char> png;
     std::wstring errorMessage;
 };
 
-static RenderPipelineResult ExecuteRenderPipeline(const std::vector<RenderBackend>& pipeline,
-                                                  size_t startIndex,
-                                                  const std::wstring& text,
-                                                  const std::wstring& sourcePath,
-                                                  bool preferSvg,
-                                                  std::wstring& firstErrorMessage) {
+static RenderPipelineResult ExecuteRenderBackend(RenderBackend backend,
+                                                 const std::wstring& text,
+                                                 const std::wstring& sourcePath,
+                                                 bool preferSvg) {
     RenderPipelineResult result;
-    if (pipeline.empty()) {
-        std::vector<RenderBackend> defaultPipeline = { RenderBackend::Java };
-        return ExecuteRenderPipeline(defaultPipeline, 0, text, sourcePath, preferSvg, firstErrorMessage);
-    }
+    result.backend = backend;
 
-    for (size_t idx = startIndex; idx < pipeline.size(); ++idx) {
-        const RenderBackend backend = pipeline[idx];
-        if (backend == RenderBackend::Java) {
-            std::wstring html;
-            std::wstring svg;
-            std::vector<unsigned char> png;
-            std::wstring error;
-            if (BuildHtmlFromJavaRender(text, preferSvg, html, &svg, &png, &error)) {
-                result.success = true;
-                result.backend = backend;
-                result.backendIndex = idx;
-                result.html = std::move(html);
-                result.svg = std::move(svg);
-                result.png = std::move(png);
-                return result;
-            }
-            if (firstErrorMessage.empty()) {
-                firstErrorMessage = !error.empty() ? error : std::wstring(L"Local Java rendering failed.");
-            }
-        } else if (backend == RenderBackend::Web) {
-            std::wstring html;
-            std::wstring error;
-            if (BuildHtmlFromWebRender(text, sourcePath, preferSvg, html, &error)) {
-                result.success = true;
-                result.backend = backend;
-                result.backendIndex = idx;
-                result.html = std::move(html);
-                if (firstErrorMessage.empty() && !error.empty()) {
-                    firstErrorMessage = error;
-                }
-                return result;
-            }
-            if (firstErrorMessage.empty()) {
-                firstErrorMessage = !error.empty() ? error : std::wstring(L"PlantUML web rendering failed.");
-            }
+    if (backend == RenderBackend::Java) {
+        std::wstring html;
+        std::wstring svg;
+        std::vector<unsigned char> png;
+        std::wstring error;
+        if (BuildHtmlFromJavaRender(text, preferSvg, html, &svg, &png, &error)) {
+            result.success = true;
+            result.html = std::move(html);
+            result.svg = std::move(svg);
+            result.png = std::move(png);
+            return result;
         }
+        result.errorMessage = !error.empty() ? error : std::wstring(L"Local Java rendering failed.");
+        return result;
     }
 
-    result.success = false;
-    result.backendIndex = std::min(startIndex, pipeline.size() - 1);
-    result.backend = pipeline[result.backendIndex];
-    result.errorMessage = firstErrorMessage.empty()
-        ? std::wstring(L"Unable to render the diagram. Check the log for details.")
-        : firstErrorMessage;
+    if (backend == RenderBackend::Web) {
+        std::wstring html;
+        std::wstring error;
+        if (BuildHtmlFromWebRender(text, sourcePath, preferSvg, html, &error)) {
+            result.success = true;
+            result.html = std::move(html);
+            if (!error.empty()) {
+                result.errorMessage = error;
+            }
+            return result;
+        }
+        result.errorMessage = !error.empty() ? error : std::wstring(L"PlantUML web rendering failed.");
+        return result;
+    }
+
+    result.errorMessage = std::wstring(L"Unsupported renderer selected.");
     return result;
 }
 
@@ -1626,8 +1597,7 @@ struct Host {
     std::vector<unsigned char> lastPng;
     bool lastPreferSvg = true;
     bool hasRender = false;
-    std::vector<RenderBackend> pipeline;
-    size_t activeRendererIndex = 0;
+    RenderBackend configuredRenderer = RenderBackend::Java;
     RenderBackend activeRenderer = RenderBackend::Java;
     std::wstring firstErrorMessage;
 };
@@ -1660,29 +1630,17 @@ static bool HostRenderAndReload(Host* host,
                                 bool preferSvg,
                                 const std::wstring& logContext,
                                 const std::wstring& failureDialogMessage,
-                                bool showDialogOnFailure,
-                                size_t startIndex = 0,
-                                const std::wstring& preservedErrorMessage = std::wstring()) {
+                                bool showDialogOnFailure) {
     if (!host) {
         return false;
     }
 
     std::wstring sourcePath;
-    std::vector<RenderBackend> pipeline;
+    RenderBackend renderer = RenderBackend::Java;
     {
         std::lock_guard<std::mutex> lock(host->stateMutex);
         sourcePath = host->sourceFilePath;
-        pipeline = host->pipeline;
-    }
-
-    if (pipeline.empty()) {
-        pipeline = GetRendererPipelineVector();
-    }
-    if (pipeline.empty()) {
-        pipeline.push_back(RenderBackend::Java);
-    }
-    if (startIndex >= pipeline.size()) {
-        startIndex = pipeline.size() - 1;
+        renderer = host->configuredRenderer;
     }
 
     if (sourcePath.empty()) {
@@ -1704,39 +1662,29 @@ static bool HostRenderAndReload(Host* host,
     const std::wstring text = ReadFileUtf16OrAnsi(sourcePath.c_str());
     AppendLog(logContext + L": file characters=" + std::to_wstring(text.size()));
 
-    std::wstring firstError = preservedErrorMessage;
-    RenderPipelineResult renderResult = ExecuteRenderPipeline(pipeline,
-                                                              startIndex,
-                                                              text,
-                                                              sourcePath,
-                                                              preferSvg,
-                                                              firstError);
+    RenderPipelineResult renderResult = ExecuteRenderBackend(renderer,
+                                                             text,
+                                                             sourcePath,
+                                                             preferSvg);
 
     std::wstring htmlToNavigate;
 
     if (renderResult.success) {
         std::wstringstream os;
-        os << logContext << L": render succeeded via " << RenderBackendName(renderResult.backend)
-           << L" (index=" << static_cast<unsigned long long>(renderResult.backendIndex) << L")";
+        os << logContext << L": render succeeded via " << RenderBackendName(renderResult.backend);
         AppendLog(os.str());
         {
             std::lock_guard<std::mutex> lock(host->stateMutex);
-            host->pipeline = pipeline;
+            host->configuredRenderer = renderer;
             host->initialHtml = renderResult.html;
             host->lastPreferSvg = preferSvg;
             host->activeRenderer = renderResult.backend;
-            host->activeRendererIndex = renderResult.backendIndex;
+            host->firstErrorMessage.clear();
             if (renderResult.backend == RenderBackend::Java) {
-                host->firstErrorMessage.clear();
                 host->lastSvg = renderResult.svg;
                 host->lastPng = renderResult.png;
                 host->hasRender = preferSvg ? !host->lastSvg.empty() : !host->lastPng.empty();
             } else {
-                if (firstError.empty()) {
-                    host->firstErrorMessage.clear();
-                } else {
-                    host->firstErrorMessage = firstError;
-                }
                 host->lastSvg.clear();
                 host->lastPng.clear();
                 host->hasRender = false;
@@ -1747,21 +1695,20 @@ static bool HostRenderAndReload(Host* host,
         std::wstring dialogMessage = failureDialogMessage.empty()
             ? std::wstring(L"Unable to render the diagram. Check the log for details.")
             : failureDialogMessage;
-        if (!firstError.empty()) {
-            dialogMessage = firstError;
+        if (!renderResult.errorMessage.empty()) {
+            dialogMessage = renderResult.errorMessage;
         }
         AppendLog(logContext + L": render failed -> " + dialogMessage);
         {
             std::lock_guard<std::mutex> lock(host->stateMutex);
-            host->pipeline = pipeline;
             host->initialHtml = BuildErrorHtml(dialogMessage, preferSvg);
             host->lastSvg.clear();
             host->lastPng.clear();
             host->lastPreferSvg = preferSvg;
             host->hasRender = false;
-            host->activeRendererIndex = std::min(startIndex, pipeline.size() - 1);
-            host->activeRenderer = pipeline[host->activeRendererIndex];
-            host->firstErrorMessage = firstError.empty() ? dialogMessage : firstError;
+            host->activeRenderer = renderer;
+            host->configuredRenderer = renderer;
+            host->firstErrorMessage = dialogMessage;
             htmlToNavigate = host->initialHtml;
         }
         if (showDialogOnFailure && host->hwnd) {
@@ -1773,7 +1720,7 @@ static bool HostRenderAndReload(Host* host,
         host->web->NavigateToString(htmlToNavigate.c_str());
     }
 
-    return true;
+    return renderResult.success;
 }
 
 static void HostHandleSaveAs(Host* host) {
@@ -1957,14 +1904,10 @@ static void HostHandleRenderFailure(Host* host, const std::wstring& message) {
         return;
     }
 
-    std::vector<RenderBackend> pipeline;
-    size_t nextIndex = 0;
     bool preferSvg = true;
     std::wstring preservedError;
     {
         std::lock_guard<std::mutex> lock(host->stateMutex);
-        pipeline = host->pipeline;
-        nextIndex = host->activeRendererIndex + 1;
         preferSvg = host->lastPreferSvg;
         if (host->firstErrorMessage.empty() && !message.empty()) {
             host->firstErrorMessage = message;
@@ -1972,29 +1915,7 @@ static void HostHandleRenderFailure(Host* host, const std::wstring& message) {
         preservedError = host->firstErrorMessage;
     }
 
-    if (pipeline.empty()) {
-        pipeline = GetRendererPipelineVector();
-    }
-
-    std::wstringstream log;
-    log << L"HostHandleRenderFailure: message='" << message
-        << L"', nextIndex=" << static_cast<unsigned long long>(nextIndex)
-        << L"/" << static_cast<unsigned long long>(pipeline.size());
-    AppendLog(log.str());
-
-    if (!pipeline.empty() && nextIndex < pipeline.size()) {
-        const RenderBackend nextBackend = pipeline[nextIndex];
-        AppendLog(L"HostHandleRenderFailure: attempting fallback to " + std::wstring(RenderBackendName(nextBackend)));
-        const std::wstring dialogMessage = preservedError.empty() ? message : preservedError;
-        HostRenderAndReload(host,
-                            preferSvg,
-                            L"HostHandleRenderFailure",
-                            dialogMessage,
-                            false,
-                            nextIndex,
-                            preservedError);
-        return;
-    }
+    AppendLog(L"HostHandleRenderFailure: message='" + message + L"'");
 
     std::wstring finalMessage = preservedError.empty() ? message : preservedError;
     if (finalMessage.empty()) {
@@ -2008,11 +1929,7 @@ static void HostHandleRenderFailure(Host* host, const std::wstring& message) {
         host->lastPng.clear();
         host->hasRender = false;
         host->firstErrorMessage = finalMessage;
-        if (!pipeline.empty()) {
-            size_t index = nextIndex == 0 ? 0 : std::min(nextIndex - 1, pipeline.size() - 1);
-            host->activeRendererIndex = index;
-            host->activeRenderer = pipeline[index];
-        }
+        host->activeRenderer = host->configuredRenderer;
     }
 
     if (host->web && !host->initialHtml.empty()) {
@@ -2373,15 +2290,14 @@ __declspec(dllexport) HWND __stdcall ListLoadW(HWND ParentWin, wchar_t* FileToLo
     const bool preferSvg = (ToLowerTrim(g_prefer) == L"svg");
     AppendLog(L"ListLoadW: preferSvg=" + std::wstring(preferSvg ? L"true" : L"false"));
 
-    std::vector<RenderBackend> pipeline = GetRendererPipelineVector();
-    AppendLog(L"ListLoadW: renderer pipeline = " + JoinRendererPipeline(pipeline));
+    RenderBackend renderer = GetConfiguredRenderer();
+    AppendLog(L"ListLoadW: renderer = " + GetConfiguredRendererName());
 
     {
         std::lock_guard<std::mutex> lock(host->stateMutex);
         host->sourceFilePath = FileToLoad ? std::wstring(FileToLoad) : std::wstring();
-        host->pipeline = pipeline;
-        host->activeRendererIndex = 0;
-        host->activeRenderer = pipeline.empty() ? RenderBackend::Java : pipeline.front();
+        host->configuredRenderer = renderer;
+        host->activeRenderer = renderer;
         host->lastPreferSvg = preferSvg;
         host->firstErrorMessage.clear();
         host->lastSvg.clear();
