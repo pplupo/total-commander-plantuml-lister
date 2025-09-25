@@ -598,16 +598,18 @@ static std::vector<unsigned char> Base64Decode(const std::wstring& in) {
 
     unsigned int buffer = 0;
     int bitsCollected = 0;
+    bool hitPadding = false;
     for (wchar_t wc : in) {
         int decoded = Base64DecodeChar(wc);
         if (decoded < 0) {
             if (decoded == -1) {
                 if (bitsCollected == 18) {
-                    out.push_back(static_cast<unsigned char>((buffer >> 16) & 0xFF));
+                    out.push_back(static_cast<unsigned char>((buffer >> 10) & 0xFF));
+                    out.push_back(static_cast<unsigned char>((buffer >> 2) & 0xFF));
                 } else if (bitsCollected == 12) {
-                    out.push_back(static_cast<unsigned char>((buffer >> 16) & 0xFF));
-                    out.push_back(static_cast<unsigned char>((buffer >> 8) & 0xFF));
+                    out.push_back(static_cast<unsigned char>((buffer >> 4) & 0xFF));
                 }
+                hitPadding = true;
                 break;
             }
             continue;
@@ -622,6 +624,16 @@ static std::vector<unsigned char> Base64Decode(const std::wstring& in) {
             bitsCollected = 0;
         }
     }
+
+    if (!hitPadding) {
+        if (bitsCollected == 18) {
+            out.push_back(static_cast<unsigned char>((buffer >> 10) & 0xFF));
+            out.push_back(static_cast<unsigned char>((buffer >> 2) & 0xFF));
+        } else if (bitsCollected == 12) {
+            out.push_back(static_cast<unsigned char>((buffer >> 4) & 0xFF));
+        }
+    }
+
     return out;
 }
 
