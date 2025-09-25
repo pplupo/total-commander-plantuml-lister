@@ -1520,6 +1520,7 @@ static bool BuildHtmlFromWebRender(const std::wstring& umlText,
 
     ReplaceAll(html, L"{{FORMAT}}", preferSvg ? L"svg" : L"png");
     ReplaceAll(html, L"{{SOURCE_NAME}}", safeSourceName);
+    ReplaceAll(html, L"{{PLANTUML_ENCODER}}", PlantumlEncoderScript());
     ReplaceAll(html, L"{{PLANTUML_SOURCE}}", escaped);
 
     outHtml.swap(html);
