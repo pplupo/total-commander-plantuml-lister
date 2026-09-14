@@ -127,6 +127,11 @@ Set `[render] renderer=java` (default) to render locally via Java and `plantuml.
 
   * Headers: `WebView2.h` from the WebView2 SDK.
   * Runtime: `WebView2Loader.dll` is **loaded dynamically** (no import library needed).
+  * PlantUML jar: **not tracked in git**. `scripts/update_plantuml.py` resolves the latest MIT-licensed jar, downloads it into `third_party/`, and updates the `[plantuml] jar=` pin in `plantumlwebview.ini` to record which version was used. The build workflow runs it automatically; run it yourself before a local build:
+
+    ```sh
+    python scripts/update_plantuml.py
+    ```
 
 Minimal CMake outline:
 

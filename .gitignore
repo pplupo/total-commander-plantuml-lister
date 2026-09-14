@@ -1,3 +1,11 @@
+# PlantUML jar — downloaded by scripts/update_plantuml.py at build time, never
+# committed. plantumlwebview.ini's [plantuml] jar= records the version in use.
+third_party/*.jar
+
+# Raw NuGet package tree left behind by the WebView2 fetch step; only the
+# flattened third_party/WebView2 subset is tracked.
+third_party/Microsoft.Web.WebView2/
+
 # Prerequisites
 *.d
 
