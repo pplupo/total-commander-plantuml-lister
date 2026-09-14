@@ -19,11 +19,10 @@ jobs:
       - name: Run update script
         id: update_script
         run: python scripts/update_plantuml.py
-      - name: Add new jar to git
+      - name: Record new jar version
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add third_party/*.jar
           git add plantumlwebview.ini
       - name: Create Pull Request
         id: cpr
@@ -33,10 +32,13 @@ jobs:
           commit-message: Update PlantUML to latest version
           title: 'Update PlantUML to latest version'
           body: |
-            This PR updates the PlantUML MIT-licensed jar to the latest version.
+            This PR points the plugin at the latest PlantUML MIT-licensed jar.
+            Only the `jar=` pin in plantumlwebview.ini changes — the jar itself is
+            downloaded at build time, not committed.
             This was done automatically by the update-plantuml workflow.
           branch: update-plantuml
           base: main
+          add-paths: plantumlwebview.ini
       - name: Enable Automerge
         if: steps.cpr.outputs.pull-request-number
         uses: peter-evans/enable-pull-request-automerge@v2
