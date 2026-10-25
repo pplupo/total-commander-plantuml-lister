@@ -18,6 +18,7 @@
 #include <atomic>
 #include <mutex>
 #include <cwchar>
+#include <ShlObj.h>
 
 #include <wincodec.h>
 
@@ -2270,7 +2271,15 @@ static void InitWebView(struct Host* host){
             return S_OK;
         });
 
-    HRESULT hrEnv = fn(nullptr, nullptr, nullptr, envCompleted.Get());
+    // Determine the LocalAppData path for storing user data for WebView2. Needed when the user has UAC enabled.
+    PWSTR localAppData = nullptr;
+    SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData);
+    std::wstring userDataFolder(localAppData);
+    userDataFolder += L"\\PlantUmlWebView";
+
+    HRESULT hrEnv = fn(nullptr, userDataFolder.c_str(), nullptr, envCompleted.Get());
+    CoTaskMemFree(localAppData);
+
     if(FAILED(hrEnv)){
         AppendLog(L"InitWebView: CreateCoreWebView2EnvironmentWithOptions call failed with HRESULT=" + std::to_wstring(hrEnv));
         HostRelease(host);
